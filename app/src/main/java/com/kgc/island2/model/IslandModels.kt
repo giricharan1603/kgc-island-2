@@ -11,11 +11,11 @@ import androidx.compose.ui.graphics.Color
 
 enum class IslandDisplayMode {
     IDLE,               // Circular ring around the camera punch-hole when not in use
-    COMPACT_SINGLE,     // Single active task or real hardware alert
-    COMPACT_SPLIT,      // Dual multitasking (Primary Pill + Secondary Circle)
-    EXPANDED_CARD,      // Long-press interactive widget
+    COMPACT_SINGLE,     // Brief system alerts
+    COMPACT_SPLIT,      // Primary Pill + Detached Side Circle (Spotify + Side Options/2nd Task)
+    EXPANDED_CARD,      // Interactive expanded widget
     ORIGIN_DRAG_WHEEL,  // Real Drag & Go installed apps dock
-    QUICK_TOOLS         // Utility dock (Real Clipboard + Stash + Torch)
+    QUICK_TOOLS         // Notification-bar quick toggles (Torch, BT, Hotspot, Rotate) + Clipboard
 }
 
 enum class TaskPriority(val level: Int) {
@@ -33,10 +33,19 @@ data class PrivacyIndicatorState(
 )
 
 @Immutable
+data class QuickTileStates(
+    val isTorchOn: Boolean = false,
+    val isBluetoothOn: Boolean = false,
+    val isAutoRotateOn: Boolean = false
+)
+
+@Immutable
 data class CutoutConfig(
     val offsetX: Int = 0,
     val offsetY: Int = 10,
-    val idleCircleSizeDp: Int = 28 // Exact circle diameter around the camera punch-hole
+    val baseWidthDp: Int = 28,
+    val baseHeightDp: Int = 28,
+    val idleCircleSizeDp: Int = 28
 )
 
 @Immutable

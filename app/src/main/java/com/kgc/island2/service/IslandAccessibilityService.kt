@@ -1,12 +1,18 @@
 package com.kgc.island2.service
 
 import android.accessibilityservice.AccessibilityService
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.*
+import android.database.ContentObserver
 import android.graphics.PixelFormat
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.media.AudioRecordingConfiguration
+import android.net.Uri
 import android.os.BatteryManager
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.*
 import android.view.accessibility.AccessibilityEvent
@@ -49,9 +55,16 @@ class IslandAccessibilityService : AccessibilityService(),
     private lateinit var cameraManager: CameraManager
     private lateinit var audioManager: AudioManager
     private lateinit var clipboardManager: ClipboardManager
+    private var bluetoothManager: BluetoothManager? = null
     private var currentTorchCameraId: String? = null
     private var isTorchOn = false
     private var lastProcessedClip: String = ""
+
+    private val rotationObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) {
+            syncQuickTileStates()
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -62,6 +75,7 @@ class IslandAccessibilityService : AccessibilityService(),
         cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         clipboardManager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as? BluetoothManager
     }
 
     override fun onServiceConnected() {
@@ -71,7 +85,16 @@ class IslandAccessibilityService : AccessibilityService(),
 
         setupOverlayWindow()
         registerHardwareAndSystemCallbacks()
+        syncQuickTileStates()
         observeDisplayModeForWindowSizing()
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        // Ensure overlay stays attached even when user closes all apps from Recents
+        if (!isViewAttached) {
+            setupOverlayWindow()
+        }
     }
 
     private fun setupOverlayWindow() {
@@ -102,7 +125,6 @@ class IslandAccessibilityService : AccessibilityService(),
             setViewTreeViewModelStoreOwner(this@IslandAccessibilityService)
             setViewTreeSavedStateRegistryOwner(this@IslandAccessibilityService)
 
-            // Auto-align to physical camera cutout on first attach
             addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
                 override fun onViewAttachedToWindow(v: View) {
                     val cutout = v.rootWindowInsets?.displayCutout
@@ -124,7 +146,6 @@ class IslandAccessibilityService : AccessibilityService(),
                 override fun onViewDetachedFromWindow(v: View) {}
             })
 
-            // Global Drag & Go Listener with Real Installed Apps
             setOnDragListener { _, event ->
                 when (event.action) {
                     DragEvent.ACTION_DRAG_STARTED -> {
@@ -183,6 +204,9 @@ class IslandAccessibilityService : AccessibilityService(),
                         performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
                     },
                     onToggleTorch = { toggleFlashlight() },
+                    onToggleBluetooth = { openOrToggleBluetooth() },
+                    onToggleHotspot = { openHotspotSettings() },
+                    onToggleAutoRotate = { toggleAutoRotate() },
                     onAdjustVolume = { delta ->
                         val direction = if (delta > 0) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
                         audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, 0)
@@ -218,7 +242,6 @@ class IslandAccessibilityService : AccessibilityService(),
 
                 val (targetW, targetH) = when (mode) {
                     IslandDisplayMode.IDLE -> {
-                        // Exact circle around camera punch-hole (widens slightly only if camera/mic dot is active)
                         val basePx = (config.idleCircleSizeDp * density).toInt()
                         val widthPx = if (privacy.isCameraActive || privacy.isMicActive) {
                             basePx + (18 * density).toInt()
@@ -228,10 +251,10 @@ class IslandAccessibilityService : AccessibilityService(),
                         Pair(widthPx, basePx)
                     }
                     IslandDisplayMode.COMPACT_SINGLE -> Pair((215 * density).toInt(), (38 * density).toInt())
-                    IslandDisplayMode.COMPACT_SPLIT -> Pair((265 * density).toInt(), (38 * density).toInt())
+                    IslandDisplayMode.COMPACT_SPLIT -> Pair((268 * density).toInt(), (38 * density).toInt())
                     IslandDisplayMode.EXPANDED_CARD,
                     IslandDisplayMode.ORIGIN_DRAG_WHEEL,
-                    IslandDisplayMode.QUICK_TOOLS -> Pair((364 * density).toInt(), (210 * density).toInt())
+                    IslandDisplayMode.QUICK_TOOLS -> Pair((364 * density).toInt(), (215 * density).toInt())
                 }
 
                 windowParams.width = targetW
@@ -260,10 +283,6 @@ class IslandAccessibilityService : AccessibilityService(),
         }
     }
 
-    /**
-     * Android 10+ blocks background clipboard access unless the overlay window briefly holds focus.
-     * This acquires focus for 60ms on copy events to read the real clipboard and immediately releases it.
-     */
     private fun captureClipboardWithBriefFocus() {
         serviceScope.launch {
             setWindowKeyboardFocusable(true)
@@ -280,6 +299,24 @@ class IslandAccessibilityService : AccessibilityService(),
         }
     }
 
+    private fun syncQuickTileStates() {
+        val btOn = try {
+            bluetoothManager?.adapter?.isEnabled == true
+        } catch (_: Exception) {
+            false
+        }
+        val rotateOn = try {
+            Settings.System.getInt(contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0) == 1
+        } catch (_: Exception) {
+            false
+        }
+        IslandStateEngine.updateQuickTileState(
+            torch = isTorchOn,
+            bluetooth = btOn,
+            autoRotate = rotateOn
+        )
+    }
+
     private fun registerHardwareAndSystemCallbacks() {
         cameraManager.registerAvailabilityCallback(object : CameraManager.AvailabilityCallback() {
             override fun onCameraAvailable(cameraId: String) {
@@ -294,20 +331,7 @@ class IslandAccessibilityService : AccessibilityService(),
             override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
                 currentTorchCameraId = cameraId
                 isTorchOn = enabled
-                if (enabled) {
-                    IslandStateEngine.submitPayload(
-                        IslandPayload.SystemAlert(
-                            id = "torch_alert",
-                            title = "Torch",
-                            subtitle = "ON",
-                            accentColor = Color(0xFFFACC15),
-                            iconType = AlertIconType.TORCH,
-                            autoDismissMs = 3500L
-                        )
-                    )
-                } else {
-                    IslandStateEngine.removePayload("torch_alert")
-                }
+                IslandStateEngine.updateQuickTileState(torch = enabled)
             }
         }, null)
 
@@ -316,6 +340,12 @@ class IslandAccessibilityService : AccessibilityService(),
                 IslandStateEngine.updatePrivacyDots(mic = !configs.isNullOrEmpty())
             }
         }, null)
+
+        contentResolver.registerContentObserver(
+            Settings.System.getUriFor(Settings.System.ACCELEROMETER_ROTATION),
+            false,
+            rotationObserver
+        )
 
         clipboardManager.addPrimaryClipChangedListener {
             val clip = clipboardManager.primaryClip
@@ -336,6 +366,7 @@ class IslandAccessibilityService : AccessibilityService(),
             addAction(Intent.ACTION_POWER_CONNECTED)
             addAction(Intent.ACTION_BATTERY_LOW)
             addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
         }
         registerReceiver(systemEventReceiver, filter)
     }
@@ -350,6 +381,10 @@ class IslandAccessibilityService : AccessibilityService(),
                 Intent.ACTION_SCREEN_ON -> {
                     composeOverlayView?.visibility = View.VISIBLE
                     IslandStateEngine.onScreenPowerStateChanged(true)
+                    syncQuickTileStates()
+                }
+                BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    syncQuickTileStates()
                 }
                 Intent.ACTION_POWER_CONNECTED -> {
                     val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
@@ -412,6 +447,52 @@ class IslandAccessibilityService : AccessibilityService(),
         }
     }
 
+    private fun openOrToggleBluetooth() {
+        try {
+            val panelIntent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(panelIntent)
+            IslandStateEngine.collapseIsland()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun openHotspotSettings() {
+        try {
+            val tetherIntent = Intent("android.settings.TETHER_SETTINGS").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(tetherIntent)
+            IslandStateEngine.collapseIsland()
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                })
+                IslandStateEngine.collapseIsland()
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun toggleAutoRotate() {
+        if (Settings.System.canWrite(this)) {
+            val current = Settings.System.getInt(contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0)
+            val next = if (current == 1) 0 else 1
+            Settings.System.putInt(contentResolver, Settings.System.ACCELEROMETER_ROTATION, next)
+            IslandStateEngine.updateQuickTileState(autoRotate = next == 1)
+        } else {
+            val writeSettingsIntent = Intent(
+                Settings.ACTION_MANAGE_WRITE_SETTINGS,
+                Uri.parse("package:$packageName")
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(writeSettingsIntent)
+            IslandStateEngine.collapseIsland()
+        }
+    }
+
     private fun pasteIntoFocusedNode(text: String) {
         val root = rootInActiveWindow ?: return
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return
@@ -447,6 +528,7 @@ class IslandAccessibilityService : AccessibilityService(),
         store.clear()
         serviceScope.cancel()
         try {
+            contentResolver.unregisterContentObserver(rotationObserver)
             unregisterReceiver(systemEventReceiver)
         } catch (_: Exception) {
         }

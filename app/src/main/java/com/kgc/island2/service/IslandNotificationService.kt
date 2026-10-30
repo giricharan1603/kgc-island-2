@@ -2,6 +2,7 @@ package com.kgc.island2.service
 
 import android.app.Notification
 import android.content.ComponentName
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -31,6 +32,9 @@ class IslandNotificationService : NotificationListenerService() {
         override fun onMetadataChanged(metadata: MediaMetadata?) {
             activeMediaController?.let { publishMediaControllerState(it) }
         }
+        override fun onSessionDestroyed() {
+            IslandStateEngine.removePayload("media_session")
+        }
     }
 
     override fun onListenerConnected() {
@@ -40,6 +44,12 @@ class IslandNotificationService : NotificationListenerService() {
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
+        requestRebind(ComponentName(this, IslandNotificationService::class.java))
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        // Keep listener bound when user swipes away apps from Recents
         requestRebind(ComponentName(this, IslandNotificationService::class.java))
     }
 
@@ -58,7 +68,11 @@ class IslandNotificationService : NotificationListenerService() {
 
     private fun attachMediaControllers(controllers: List<MediaController>) {
         activeMediaController?.unregisterCallback(mediaCallback)
-        val active = controllers.firstOrNull()
+        // Prefer a controller that is actively playing, or fall back to the first active session
+        val active = controllers.firstOrNull {
+            it.playbackState?.state == PlaybackState.STATE_PLAYING
+        } ?: controllers.firstOrNull()
+
         activeMediaController = active
         if (active == null) {
             IslandStateEngine.removePayload("media_session")
@@ -71,14 +85,22 @@ class IslandNotificationService : NotificationListenerService() {
     private fun publishMediaControllerState(controller: MediaController) {
         parserScope.launch {
             val meta = controller.metadata ?: return@launch
-            val state = controller.playbackState
-            val isPlaying = state?.state == PlaybackState.STATE_PLAYING
+            val state = controller.playbackState?.state ?: PlaybackState.STATE_NONE
 
-            if (!isPlaying && state?.state != PlaybackState.STATE_PAUSED) {
+            // Keep Spotify/music alive during track skips, buffering, and pause
+            val isActiveState = state == PlaybackState.STATE_PLAYING ||
+                    state == PlaybackState.STATE_PAUSED ||
+                    state == PlaybackState.STATE_BUFFERING ||
+                    state == PlaybackState.STATE_SKIPPING_TO_NEXT ||
+                    state == PlaybackState.STATE_SKIPPING_TO_PREVIOUS ||
+                    state == PlaybackState.STATE_CONNECTING
+
+            if (!isActiveState) {
                 IslandStateEngine.removePayload("media_session")
                 return@launch
             }
 
+            val isPlaying = state == PlaybackState.STATE_PLAYING || state == PlaybackState.STATE_BUFFERING
             val title = meta.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
             val artist = meta.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
             if (title.isBlank() && artist.isBlank()) return@launch
@@ -93,8 +115,11 @@ class IslandNotificationService : NotificationListenerService() {
             } ?: Color(0xFF1DB954)
 
             val duration = meta.getLong(MediaMetadata.METADATA_KEY_DURATION).coerceAtLeast(1L)
-            val pos = state?.position ?: 0L
+            val pos = controller.playbackState?.position ?: 0L
             val progress = (pos.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+
+            val launchIntent = controller.sessionActivity
+            val pkg = controller.packageName
 
             IslandStateEngine.submitPayload(
                 IslandPayload.MediaActivity(
@@ -104,11 +129,15 @@ class IslandNotificationService : NotificationListenerService() {
                     accentColor = dominantColor,
                     isPlaying = isPlaying,
                     progress = progress,
-                    packageName = controller.packageName,
-                    contentIntent = controller.sessionActivity,
+                    packageName = pkg,
+                    contentIntent = launchIntent,
                     onPlayPause = {
-                        if (isPlaying) controller.transportControls.pause()
-                        else controller.transportControls.play()
+                        val currentState = controller.playbackState?.state
+                        if (currentState == PlaybackState.STATE_PLAYING) {
+                            controller.transportControls.pause()
+                        } else {
+                            controller.transportControls.play()
+                        }
                     },
                     onNext = { controller.transportControls.skipToNext() },
                     onPrevious = { controller.transportControls.skipToPrevious() }
@@ -119,6 +148,12 @@ class IslandNotificationService : NotificationListenerService() {
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null || sbn.packageName == packageName) return
+        // Ignore media-style notifications here since MediaController handles them with full transport controls
+        if (sbn.notification.extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) {
+            setupMediaSessionTracking()
+            return
+        }
+
         parserScope.launch {
             val notif = sbn.notification
             val extras = notif.extras
@@ -130,7 +165,6 @@ class IslandNotificationService : NotificationListenerService() {
             val category = notif.category
             val largeIconBitmap = notif.getLargeIcon()?.loadDrawable(this@IslandNotificationService)?.toBitmap(96)
 
-            // 1. Real Incoming & Ongoing Calls
             if (category == Notification.CATEGORY_CALL) {
                 val actions = notif.actions.orEmpty()
                 val acceptIntent = actions.firstOrNull()?.actionIntent
@@ -151,12 +185,11 @@ class IslandNotificationService : NotificationListenerService() {
                 return@launch
             }
 
-            // 2. Real Progress Notifications (Navigation, Timers, Downloads, Delivery)
             val progressMax = extras.getInt(Notification.EXTRA_PROGRESS_MAX, 0)
             val progressCur = extras.getInt(Notification.EXTRA_PROGRESS, 0)
             val isIndeterminate = extras.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false)
 
-            if (progressMax > 0 || category == Notification.CATEGORY_NAVIGATION || category == Notification.CATEGORY_PROGRESS) {
+            if (progressMax > 0 || category == Notification.CATEGORY_NAVIGATION || category == Notification.CATEGORY_PROGRESS || category == Notification.CATEGORY_ALARM || category == Notification.CATEGORY_STOPWATCH) {
                 val fraction = if (progressMax > 0) {
                     (progressCur.toFloat() / progressMax.toFloat()).coerceIn(0f, 1f)
                 } else {
@@ -181,7 +214,6 @@ class IslandNotificationService : NotificationListenerService() {
                 return@launch
             }
 
-            // 3. Real Messaging & Notifications with Inline Reply
             val replyAction = notif.actions?.firstOrNull { !it.remoteInputs.isNullOrEmpty() }
             if (category == Notification.CATEGORY_MESSAGE || replyAction != null || sbn.isClearable) {
                 IslandStateEngine.submitPayload(
