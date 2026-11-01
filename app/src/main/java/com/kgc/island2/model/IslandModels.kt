@@ -53,7 +53,8 @@ data class QuickTileStates(
     val isHotspotOn: Boolean = false,
     val isAutoRotateOn: Boolean = false,
     val ringerMode: Int = AudioManager.RINGER_MODE_NORMAL,
-    val volumeFraction: Float = 0.5f
+    val volumeFraction: Float = 0.5f,
+    val brightnessFraction: Float = 0.5f
 )
 
 @Immutable
@@ -64,7 +65,8 @@ data class CutoutConfig(
     val baseHeightDp: Int = 30,
     val idleCircleSizeDp: Int = 30,
     val isLandscape: Boolean = false,
-    val landscapeCutoutX: Int = 0,
+    val landscapeRotation: Int = 0,
+    val landscapeCutoutX: Int = 14,
     val landscapeCutoutY: Int = 0
 )
 
@@ -162,6 +164,7 @@ sealed interface IslandPayload {
         val etaOrTimerText: String,
         val progressFraction: Float = 0f,
         val isIndeterminate: Boolean = false,
+        val stageCount: Int = 4,
         val accentColor: Color = Color(0xFF38BDF8),
         val appIcon: Bitmap? = null,
         val contentIntent: PendingIntent? = null,

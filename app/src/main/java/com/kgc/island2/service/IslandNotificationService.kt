@@ -10,16 +10,20 @@ import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import androidx.compose.ui.graphics.Color
 import com.kgc.island2.engine.IslandStateEngine
 import com.kgc.island2.model.IslandPayload
+import kotlinx.coroutines.*
 
 class IslandNotificationService : NotificationListenerService() {
 
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var mediaSessionManager: MediaSessionManager? = null
     private val activeCallbacks = mutableMapOf<MediaController, MediaController.Callback>()
+    private var progressTickerJob: Job? = null
 
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
         bindMediaControllers(controllers.orEmpty())
@@ -45,6 +49,7 @@ class IslandNotificationService : NotificationListenerService() {
             controller.unregisterCallback(callback)
         }
         activeCallbacks.clear()
+        progressTickerJob?.cancel()
 
         if (controllers.isEmpty()) {
             IslandStateEngine.removePayload("media_session")
@@ -69,6 +74,19 @@ class IslandNotificationService : NotificationListenerService() {
             activeCallbacks[controller] = callback
             publishMediaState(controller)
         }
+
+        // Live 1-second progress bar updater while music is playing
+        progressTickerJob = serviceScope.launch {
+            while (isActive) {
+                delay(1000L)
+                val activeCtrl = activeCallbacks.keys.firstOrNull {
+                    it.playbackState?.state == PlaybackState.STATE_PLAYING
+                }
+                if (activeCtrl != null) {
+                    publishMediaState(activeCtrl)
+                }
+            }
+        }
     }
 
     private fun publishMediaState(controller: MediaController) {
@@ -90,8 +108,16 @@ class IslandNotificationService : NotificationListenerService() {
         val art = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
             ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
         val duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION).coerceAtLeast(1L)
-        val position = (state?.position ?: 0L).coerceIn(0L, duration)
-        val progress = (position.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+
+        val basePos = state?.position ?: 0L
+        val lastUpdate = state?.lastPositionUpdateTime ?: 0L
+        val currentPos = if (pbState == PlaybackState.STATE_PLAYING && lastUpdate > 0L) {
+            val elapsed = (SystemClock.elapsedRealtime() - lastUpdate).coerceAtLeast(0L)
+            (basePos + (elapsed * (state?.playbackSpeed ?: 1f)).toLong()).coerceIn(0L, duration)        } else {
+            basePos.coerceIn(0L, duration)
+        }
+
+        val progress = (currentPos.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
         val isPlaying = pbState == PlaybackState.STATE_PLAYING || pbState == PlaybackState.STATE_BUFFERING
 
         IslandStateEngine.submitPayload(
@@ -103,6 +129,7 @@ class IslandNotificationService : NotificationListenerService() {
                 accentColor = extractDominantColor(art),
                 isPlaying = isPlaying,
                 progress = progress,
+                durationMs = duration,
                 packageName = controller.packageName,
                 contentIntent = controller.sessionActivity,
                 onPlayPause = {
@@ -114,7 +141,10 @@ class IslandNotificationService : NotificationListenerService() {
                     }
                 },
                 onNext = { controller.transportControls.skipToNext() },
-                onPrevious = { controller.transportControls.skipToPrevious() }
+                onPrevious = { controller.transportControls.skipToPrevious() },
+                onSeekTo = { seekPosMs ->
+                    controller.transportControls.seekTo(seekPosMs)
+                }
             )
         )
     }
@@ -200,6 +230,12 @@ class IslandNotificationService : NotificationListenerService() {
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
         val key = sbn?.key ?: return
         IslandStateEngine.removePayload(key)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        progressTickerJob?.cancel()
+        serviceScope.cancel()
     }
 
     private fun getSmallAppIconBitmap(pkg: String): Bitmap? {

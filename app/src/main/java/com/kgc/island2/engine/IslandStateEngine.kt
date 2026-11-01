@@ -58,8 +58,10 @@ object IslandStateEngine {
             when (payload) {
                 is IslandPayload.SystemAlert,
                 is IslandPayload.OriginAiSuggestion -> {
+                    // Feature 4: Persistent Hotspot (isOngoing = true) stays in ongoingTasks until turned off!
                     if (payload.isOngoing) {
-                        isUserMinimized = false
+                        val isNew = !ongoingTasks.containsKey(payload.id)
+                        if (isNew) isUserMinimized = false
                         ongoingTasks[payload.id] = payload
                         recalculateSlots()
                     } else {
@@ -68,7 +70,7 @@ object IslandStateEngine {
                         _displayMode.value = IslandDisplayMode.COMPACT_SINGLE
 
                         autoDismissJob?.cancel()
-                        val timeout = payload.autoDismissMs ?: 3500L
+                        val timeout = payload.autoDismissMs ?: 2800L
                         autoDismissJob = launch {
                             delay(timeout)
                             restoreOngoingState(previousPrimary)
@@ -94,6 +96,7 @@ object IslandStateEngine {
                 }
 
                 is IslandPayload.MediaActivity -> {
+                    // Feature 2: Only un-minimize when a new song starts, so progress ticks don't force it back open
                     if (lastTrackTitle != payload.trackTitle) {
                         lastTrackTitle = payload.trackTitle
                         isUserMinimized = false
@@ -146,7 +149,11 @@ object IslandStateEngine {
             sorted.isEmpty() -> {
                 _primarySlot.value = IslandPayload.Idle
                 _secondarySlot.value = null
-                _displayMode.value = IslandDisplayMode.IDLE
+                if (_displayMode.value != IslandDisplayMode.QUICK_TOOLS &&
+                    _displayMode.value != IslandDisplayMode.ORIGIN_DRAG_WHEEL
+                ) {
+                    _displayMode.value = IslandDisplayMode.IDLE
+                }
             }
             sorted.size == 1 -> {
                 _primarySlot.value = sorted[0]
@@ -154,9 +161,14 @@ object IslandStateEngine {
                 if (isUserMinimized) {
                     _displayMode.value = IslandDisplayMode.IDLE
                 } else if (_displayMode.value != IslandDisplayMode.EXPANDED_CARD &&
-                    _displayMode.value != IslandDisplayMode.QUICK_TOOLS
+                    _displayMode.value != IslandDisplayMode.QUICK_TOOLS &&
+                    _displayMode.value != IslandDisplayMode.ORIGIN_DRAG_WHEEL
                 ) {
-                    _displayMode.value = IslandDisplayMode.COMPACT_SPLIT
+                    _displayMode.value = if (sorted[0] is IslandPayload.MediaActivity) {
+                        IslandDisplayMode.COMPACT_SPLIT
+                    } else {
+                        IslandDisplayMode.COMPACT_SINGLE
+                    }
                 }
             }
             else -> {
@@ -165,7 +177,8 @@ object IslandStateEngine {
                 if (isUserMinimized) {
                     _displayMode.value = IslandDisplayMode.IDLE
                 } else if (_displayMode.value != IslandDisplayMode.EXPANDED_CARD &&
-                    _displayMode.value != IslandDisplayMode.QUICK_TOOLS
+                    _displayMode.value != IslandDisplayMode.QUICK_TOOLS &&
+                    _displayMode.value != IslandDisplayMode.ORIGIN_DRAG_WHEEL
                 ) {
                     _displayMode.value = IslandDisplayMode.COMPACT_SPLIT
                 }
@@ -209,7 +222,7 @@ object IslandStateEngine {
     }
 
     fun onIdleCircleTapped() {
-        if (isUserMinimized && ongoingTasks.isNotEmpty()) {
+        if (ongoingTasks.isNotEmpty()) {
             isUserMinimized = false
             recalculateSlots()
         } else {
@@ -231,7 +244,11 @@ object IslandStateEngine {
     }
 
     fun collapseIsland() {
-        recalculateSlots()
+        if (ongoingTasks.isEmpty()) {
+            _displayMode.value = IslandDisplayMode.IDLE
+        } else {
+            recalculateSlots()
+        }
     }
 
     fun minimizeToIdle() {
@@ -239,12 +256,25 @@ object IslandStateEngine {
         _displayMode.value = IslandDisplayMode.IDLE
     }
 
+    /**
+     * Feature 2 & 5: Swipe Up / Dismiss Gesture
+     * - In Horizontal (Landscape) mode: Any swipe up while in use immediately sends Kgc Island to the camera punch-hole!
+     * - In Portrait mode: Collapses Expanded Card -> Compact Pill on 1st swipe up, and Compact Pill -> Camera Ring on 2nd swipe up.
+     */
     fun handleDismissSwipe() {
+        if (_cutoutConfig.value.isLandscape) {
+            minimizeToIdle()
+            return
+        }
         when (_displayMode.value) {
             IslandDisplayMode.EXPANDED_CARD,
             IslandDisplayMode.QUICK_TOOLS,
             IslandDisplayMode.ORIGIN_DRAG_WHEEL -> {
-                recalculateSlots()
+                if (ongoingTasks.isEmpty()) {
+                    minimizeToIdle()
+                } else {
+                    collapseIsland()
+                }
             }
             IslandDisplayMode.COMPACT_SINGLE,
             IslandDisplayMode.COMPACT_SPLIT -> {
@@ -263,7 +293,6 @@ object IslandStateEngine {
         }
     }
 
-    // Both method names supported so neither AccessibilityService nor other files fail:
     fun updatePrivacyDots(camera: Boolean? = null, mic: Boolean? = null) {
         _privacyState.update {
             it.copy(
@@ -282,7 +311,8 @@ object IslandStateEngine {
         hotspot: Boolean? = null,
         autoRotate: Boolean? = null,
         ringerMode: Int? = null,
-        volumeFraction: Float? = null
+        volumeFraction: Float? = null,
+        brightnessFraction: Float? = null
     ) {
         _quickTileStates.update {
             it.copy(
@@ -291,7 +321,8 @@ object IslandStateEngine {
                 isHotspotOn = hotspot ?: it.isHotspotOn,
                 isAutoRotateOn = autoRotate ?: it.isAutoRotateOn,
                 ringerMode = ringerMode ?: it.ringerMode,
-                volumeFraction = volumeFraction ?: it.volumeFraction
+                volumeFraction = volumeFraction ?: it.volumeFraction,
+                brightnessFraction = brightnessFraction ?: it.brightnessFraction
             )
         }
     }
@@ -302,8 +333,9 @@ object IslandStateEngine {
         hotspot: Boolean? = null,
         autoRotate: Boolean? = null,
         ringerMode: Int? = null,
-        volumeFraction: Float? = null
-    ) = updateQuickTileState(torch, bluetooth, hotspot, autoRotate, ringerMode, volumeFraction)
+        volumeFraction: Float? = null,
+        brightnessFraction: Float? = null
+    ) = updateQuickTileState(torch, bluetooth, hotspot, autoRotate, ringerMode, volumeFraction, brightnessFraction)
 
     fun addToStash(item: StashItem) {
         _stashItems.update { (listOf(item) + it).take(10) }

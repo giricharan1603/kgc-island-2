@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -59,6 +60,7 @@ fun IslandOverlayScreen(
     onToggleAutoRotate: () -> Unit,
     onToggleRingerMode: () -> Unit = {},
     onSetVolumeFraction: (Float) -> Unit = {},
+    onSetBrightnessFraction: (Float) -> Unit = {},
     onAdjustVolume: (Float) -> Unit,
     onRequestKeyboardFocus: (Boolean) -> Unit,
     onPasteTextToFocusedApp: (String) -> Unit
@@ -83,7 +85,13 @@ fun IslandOverlayScreen(
         label = "width"
     ) { mode ->
         when (mode) {
-            IslandDisplayMode.IDLE -> cutoutConfig.idleCircleSizeDp.dp
+            IslandDisplayMode.IDLE -> {
+                if (privacyState.isCameraActive || privacyState.isMicActive) {
+                    (cutoutConfig.idleCircleSizeDp + 18).dp
+                } else {
+                    cutoutConfig.idleCircleSizeDp.dp
+                }
+            }
             IslandDisplayMode.COMPACT_SINGLE -> 212.dp
             IslandDisplayMode.COMPACT_SPLIT -> 264.dp
             IslandDisplayMode.EXPANDED_CARD,
@@ -102,7 +110,7 @@ fun IslandOverlayScreen(
             IslandDisplayMode.COMPACT_SPLIT -> 36.dp
             IslandDisplayMode.EXPANDED_CARD,
             IslandDisplayMode.ORIGIN_DRAG_WHEEL,
-            IslandDisplayMode.QUICK_TOOLS -> 212.dp
+            IslandDisplayMode.QUICK_TOOLS -> 218.dp
         }
     }
 
@@ -118,12 +126,30 @@ fun IslandOverlayScreen(
         }
     }
 
-    // Feature 1: Transparent interior in IDLE so ONLY the circumference ring wraps the camera punch-hole!
+    // Feature 1: Transparent fill in IDLE mode so ONLY the circumference ring wraps around the camera hole!
     val containerBgColor by transition.animateColor(
         transitionSpec = { tween(220) },
         label = "bg_color"
     ) { mode ->
         if (mode == IslandDisplayMode.IDLE) Color.Transparent else Color.Black
+    }
+
+    val idleRingBrush = remember(primaryPayload, quickTileStates.isHotspotOn, privacyState) {
+        when {
+            privacyState.isCameraActive || privacyState.isMicActive -> {
+                Brush.linearGradient(listOf(Color(0xFF22C55E), Color(0xFFF97316)))
+            }
+            quickTileStates.isHotspotOn -> {
+                Brush.linearGradient(listOf(Color(0xFF22C55E), Color(0xFF4ADE80)))
+            }
+            primaryPayload is IslandPayload.MediaActivity -> {
+                val accent = (primaryPayload as IslandPayload.MediaActivity).accentColor
+                Brush.linearGradient(listOf(accent, Color(0xFF38BDF8)))
+            }
+            else -> {
+                Brush.linearGradient(listOf(Color(0xFF38BDF8), Color(0xFFA855F7)))
+            }
+        }
     }
 
     var cumulativeDx by remember { mutableFloatStateOf(0f) }
@@ -136,7 +162,7 @@ fun IslandOverlayScreen(
                     view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                     when (displayMode) {
                         IslandDisplayMode.IDLE -> IslandStateEngine.onIdleCircleTapped()
-                        // Feature 2: Clicking compact pill expands the island to show controls instead of opening Spotify
+                        // Feature 2: Clicking compact pill expands the island to show song controls instead of opening Spotify!
                         IslandDisplayMode.COMPACT_SINGLE,
                         IslandDisplayMode.COMPACT_SPLIT -> IslandStateEngine.expandIsland()
                         else -> {}
@@ -168,7 +194,6 @@ fun IslandOverlayScreen(
                     val isSwipeDown = cumulativeDy > 42f
 
                     when {
-                        // Feature 2 & 5: Swipe up closes/collapses or moves directly to the camera punch-hole
                         isSwipeUp || isHorizontalSwipe || isDiagonalUp -> {
                             view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                             onRequestKeyboardFocus(false)
@@ -190,25 +215,6 @@ fun IslandOverlayScreen(
             )
         }
 
-    // Dynamic Circumference Border Brush for Idle Camera Ring
-    val idleRingBrush = remember(primaryPayload, quickTileStates.isHotspotOn, privacyState) {
-        when {
-            privacyState.isCameraActive || privacyState.isMicActive -> {
-                Brush.linearGradient(listOf(Color(0xFF22C55E), Color(0xFFF97316)))
-            }
-            quickTileStates.isHotspotOn -> {
-                Brush.linearGradient(listOf(Color(0xFF22C55E), Color(0xFF4ADE80)))
-            }
-            primaryPayload is IslandPayload.MediaActivity -> {
-                val accent = (primaryPayload as IslandPayload.MediaActivity).accentColor
-                Brush.linearGradient(listOf(accent, Color(0xFF38BDF8)))
-            }
-            else -> {
-                Brush.linearGradient(listOf(Color(0xFF38BDF8), Color(0xFFA855F7)))
-            }
-        }
-    }
-
     if (displayMode == IslandDisplayMode.COMPACT_SPLIT) {
         Row(
             modifier = Modifier
@@ -218,7 +224,7 @@ fun IslandOverlayScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // Left Primary Pill (Tapping expands the island to show song controls!)
+            // Left Primary Pill: Tapping expands to big control card (never auto-opens Spotify app)
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -242,7 +248,7 @@ fun IslandOverlayScreen(
 
             Spacer(modifier = Modifier.width(8.dp))
 
-            // Detached Right Side Circle (Swaps 2nd task like Hotspot/Timer or opens Quick Tools)
+            // Right Detached Circle: Swaps Hotspot/2nd task or opens Quick Tools
             Box(
                 modifier = Modifier
                     .size(36.dp)
@@ -283,8 +289,8 @@ fun IslandOverlayScreen(
         ) {
             when (displayMode) {
                 IslandDisplayMode.IDLE -> {
-                    // Feature 1: Hollow circumference only — no solid black interior
-                    IdleHollowCircumference(privacyState = privacyState)
+                    // Feature 1: Hollow Circumference Ring Only
+                    IdleHollowCircumferenceRing(privacyState = privacyState)
                 }
 
                 IslandDisplayMode.COMPACT_SINGLE -> {
@@ -334,6 +340,7 @@ fun IslandOverlayScreen(
                         onToggleAutoRotate = onToggleAutoRotate,
                         onToggleRingerMode = onToggleRingerMode,
                         onSetVolumeFraction = onSetVolumeFraction,
+                        onSetBrightnessFraction = onSetBrightnessFraction,
                         onPasteText = { text ->
                             onPasteTextToFocusedApp(text)
                             IslandStateEngine.collapseIsland()
@@ -349,11 +356,10 @@ fun IslandOverlayScreen(
 }
 
 @Composable
-private fun IdleHollowCircumference(privacyState: PrivacyIndicatorState) {
-    // Interior remains 100% transparent so only the outer circumference border ring is visible
+private fun IdleHollowCircumferenceRing(privacyState: PrivacyIndicatorState) {
     Box(
         modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.TopEnd
+        contentAlignment = Alignment.CenterEnd
     ) {
         if (privacyState.isCameraActive || privacyState.isMicActive) {
             PrivacyDotsRow(privacyState)
@@ -458,6 +464,7 @@ private fun CompactSingleView(
     privacyState: PrivacyIndicatorState,
     onToggleTorch: () -> Unit
 ) {
+    val context = LocalContext.current
     Row(
         modifier = Modifier.fillMaxSize(),
         verticalAlignment = Alignment.CenterVertically,
@@ -469,7 +476,7 @@ private fun CompactSingleView(
                     imageVector = when (payload.iconType) {
                         AlertIconType.CHARGING -> Icons.Default.BatteryChargingFull
                         AlertIconType.LOW_BATTERY -> Icons.Default.BatteryAlert
-                        AlertIconType.RINGER_SILENT -> Icons.Default.VolumeOff
+                        AlertIconType.RINGER_SILENT -> Icons.AutoMirrored.Filled.VolumeOff
                         AlertIconType.RINGER_VIBRATE -> Icons.Default.Vibration
                         AlertIconType.TORCH -> Icons.Default.FlashlightOn
                         AlertIconType.HOTSPOT -> Icons.Default.WifiTethering
@@ -594,7 +601,6 @@ private fun CompactSingleView(
             }
 
             is IslandPayload.OriginAiSuggestion -> {
-                val context = LocalContext.current
                 val firstApp = payload.targetApps.firstOrNull()
                 Row(
                     modifier = Modifier
@@ -633,7 +639,7 @@ private fun CompactSingleView(
                         modifier = Modifier.weight(1f)
                     )
                     Icon(
-                        imageVector = Icons.Default.ArrowForwardIos,
+                        imageVector = Icons.AutoMirrored.Filled.ArrowForwardIos,
                         contentDescription = null,
                         tint = Color.White.copy(alpha = 0.7f),
                         modifier = Modifier.size(12.dp)
@@ -713,7 +719,7 @@ private fun ExpandedIslandCard(
                             .background(Color(0xFF1E293B))
                     ) {
                         Icon(
-                            imageVector = Icons.Default.OpenInNew,
+                            imageVector = Icons.AutoMirrored.Filled.OpenInNew,
                             contentDescription = null,
                             tint = payload.accentColor,
                             modifier = Modifier.size(15.dp)
@@ -771,19 +777,14 @@ private fun ExpandedIslandCard(
                         .height(22.dp)
                 )
 
-                // Song Transport Control Buttons + Hide to Camera Hole Button
+                // Song Control Buttons + Minimize to Camera Ring Button
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = { payload.onPrevious?.invoke() }) {
-                        Icon(
-                            Icons.Default.SkipPrevious,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(30.dp)
-                        )
+                        Icon(Icons.Default.SkipPrevious, contentDescription = null, tint = Color.White, modifier = Modifier.size(30.dp))
                     }
                     IconButton(onClick = { payload.onPlayPause?.invoke() }) {
                         Icon(
@@ -794,20 +795,10 @@ private fun ExpandedIslandCard(
                         )
                     }
                     IconButton(onClick = { payload.onNext?.invoke() }) {
-                        Icon(
-                            Icons.Default.SkipNext,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(30.dp)
-                        )
+                        Icon(Icons.Default.SkipNext, contentDescription = null, tint = Color.White, modifier = Modifier.size(30.dp))
                     }
                     IconButton(onClick = onMinimizeToHole) {
-                        Icon(
-                            Icons.Default.VisibilityOff,
-                            contentDescription = null,
-                            tint = Color.Gray,
-                            modifier = Modifier.size(20.dp)
-                        )
+                        Icon(Icons.Default.VisibilityOff, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(20.dp))
                     }
                 }
             }
@@ -855,7 +846,7 @@ private fun ExpandedIslandCard(
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("Open Quick Toggles", color = Color.White)
+                    Text("Open Direct Quick Toggles", color = Color.White)
                 }
             }
 
@@ -952,7 +943,7 @@ private fun ExpandedIslandCard(
                             },
                             modifier = Modifier.size(28.dp)
                         ) {
-                            Icon(Icons.Default.Send, contentDescription = null, tint = Color(0xFF38BDF8))
+                            Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, tint = Color(0xFF38BDF8))
                         }
                     }
                 }
@@ -1055,7 +1046,7 @@ private fun OriginDragAppsDock(
 }
 
 /**
- * Feature 3: Direct Action Quick Settings Dock (Toggles ON/OFF directly inside the island)
+ * Feature 3: Direct One-Tap ON/OFF Hardware Toggles + Dual Volume & Brightness Sliders
  */
 @Composable
 private fun IdleQuickToolsDock(
@@ -1068,6 +1059,7 @@ private fun IdleQuickToolsDock(
     onToggleAutoRotate: () -> Unit,
     onToggleRingerMode: () -> Unit,
     onSetVolumeFraction: (Float) -> Unit,
+    onSetBrightnessFraction: (Float) -> Unit,
     onPasteText: (String) -> Unit,
     onClose: () -> Unit
 ) {
@@ -1126,9 +1118,9 @@ private fun IdleQuickToolsDock(
             )
             QuickSettingCircleTile(
                 icon = when (quickTileStates.ringerMode) {
-                    AudioManager.RINGER_MODE_SILENT -> Icons.Default.VolumeOff
+                    AudioManager.RINGER_MODE_SILENT -> Icons.AutoMirrored.Filled.VolumeOff
                     AudioManager.RINGER_MODE_VIBRATE -> Icons.Default.Vibration
-                    else -> Icons.Default.VolumeUp
+                    else -> Icons.AutoMirrored.Filled.VolumeUp
                 },
                 label = when (quickTileStates.ringerMode) {
                     AudioManager.RINGER_MODE_SILENT -> "Mute"
@@ -1153,32 +1145,60 @@ private fun IdleQuickToolsDock(
             }
         }
 
-        // Row 2: Direct In-Island Volume Control Bar
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 6.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = Icons.Default.VolumeUp,
-                contentDescription = null,
-                tint = Color(0xFF38BDF8),
-                modifier = Modifier.size(18.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Slider(
-                value = quickTileStates.volumeFraction,
-                onValueChange = onSetVolumeFraction,
-                colors = SliderDefaults.colors(
-                    thumbColor = Color(0xFF38BDF8),
-                    activeTrackColor = Color(0xFF38BDF8),
-                    inactiveTrackColor = Color(0xFF1E293B)
-                ),
+        // Row 2: Direct In-Island Volume & Brightness Sliders
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .height(20.dp)
-            )
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                    contentDescription = null,
+                    tint = Color(0xFF38BDF8),
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Slider(
+                    value = quickTileStates.volumeFraction,
+                    onValueChange = onSetVolumeFraction,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Color(0xFF38BDF8),
+                        activeTrackColor = Color(0xFF38BDF8),
+                        inactiveTrackColor = Color(0xFF1E293B)
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(18.dp)
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Brightness6,
+                    contentDescription = null,
+                    tint = Color(0xFFFACC15),
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Slider(
+                    value = quickTileStates.brightnessFraction,
+                    onValueChange = onSetBrightnessFraction,
+                    colors = SliderDefaults.colors(
+                        thumbColor = Color(0xFFFACC15),
+                        activeTrackColor = Color(0xFFFACC15),
+                        inactiveTrackColor = Color(0xFF1E293B)
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(18.dp)
+                )
+            }
         }
 
         // Row 3: Clipboard & Stash Quick Paste Chips
@@ -1190,10 +1210,10 @@ private fun IdleQuickToolsDock(
                             .clip(RoundedCornerShape(14.dp))
                             .background(Color(0xFF1E293B))
                             .clickable { onPasteText(clipText) }
-                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
                     ) {
                         Text(
-                            text = clipText.take(30),
+                            text = clipText.take(28),
                             color = Color.White,
                             fontSize = 11.sp,
                             maxLines = 1
@@ -1207,10 +1227,10 @@ private fun IdleQuickToolsDock(
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(Color(0xFF312E81))
                                 .clickable { onPasteText(text) }
-                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
                         ) {
                             Text(
-                                text = text.take(30),
+                                text = text.take(28),
                                 color = Color.White,
                                 fontSize = 11.sp,
                                 maxLines = 1
