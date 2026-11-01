@@ -7,7 +7,10 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.media.AudioManager
 import android.os.Bundle
+import android.view.HapticFeedbackConstants
+import androidx.compose.animation.animateColor
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -28,12 +31,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -49,15 +54,17 @@ import kotlin.math.sin
 fun IslandOverlayScreen(
     onStatusBarSwipeDown: () -> Unit,
     onToggleTorch: () -> Unit,
-    onToggleBluetooth: () -> Unit = {},
-    onToggleHotspot: () -> Unit = {},
-    onToggleAutoRotate: () -> Unit = {},
+    onToggleBluetooth: () -> Unit,
+    onToggleHotspot: () -> Unit,
+    onToggleAutoRotate: () -> Unit,
+    onToggleRingerMode: () -> Unit = {},
+    onSetVolumeFraction: (Float) -> Unit = {},
     onAdjustVolume: (Float) -> Unit,
-    onAdjustBrightness: (Float) -> Unit = {},
     onRequestKeyboardFocus: (Boolean) -> Unit,
     onPasteTextToFocusedApp: (String) -> Unit
 ) {
     val context = LocalContext.current
+    val view = LocalView.current
     val displayMode by IslandStateEngine.displayMode.collectAsState()
     val primaryPayload by IslandStateEngine.primarySlot.collectAsState()
     val secondaryPayload by IslandStateEngine.secondarySlot.collectAsState()
@@ -76,15 +83,9 @@ fun IslandOverlayScreen(
         label = "width"
     ) { mode ->
         when (mode) {
-            IslandDisplayMode.IDLE -> {
-                if (privacyState.isCameraActive || privacyState.isMicActive) {
-                    (cutoutConfig.baseWidthDp + 18).dp
-                } else {
-                    cutoutConfig.baseWidthDp.dp
-                }
-            }
-            IslandDisplayMode.COMPACT_SINGLE -> 210.dp
-            IslandDisplayMode.COMPACT_SPLIT -> 262.dp
+            IslandDisplayMode.IDLE -> cutoutConfig.idleCircleSizeDp.dp
+            IslandDisplayMode.COMPACT_SINGLE -> 212.dp
+            IslandDisplayMode.COMPACT_SPLIT -> 264.dp
             IslandDisplayMode.EXPANDED_CARD,
             IslandDisplayMode.ORIGIN_DRAG_WHEEL,
             IslandDisplayMode.QUICK_TOOLS -> 356.dp
@@ -96,12 +97,12 @@ fun IslandOverlayScreen(
         label = "height"
     ) { mode ->
         when (mode) {
-            IslandDisplayMode.IDLE -> cutoutConfig.baseHeightDp.dp
+            IslandDisplayMode.IDLE -> cutoutConfig.idleCircleSizeDp.dp
             IslandDisplayMode.COMPACT_SINGLE,
             IslandDisplayMode.COMPACT_SPLIT -> 36.dp
             IslandDisplayMode.EXPANDED_CARD,
             IslandDisplayMode.ORIGIN_DRAG_WHEEL,
-            IslandDisplayMode.QUICK_TOOLS -> 204.dp
+            IslandDisplayMode.QUICK_TOOLS -> 212.dp
         }
     }
 
@@ -117,6 +118,14 @@ fun IslandOverlayScreen(
         }
     }
 
+    // Feature 1: Transparent interior in IDLE so ONLY the circumference ring wraps the camera punch-hole!
+    val containerBgColor by transition.animateColor(
+        transitionSpec = { tween(220) },
+        label = "bg_color"
+    ) { mode ->
+        if (mode == IslandDisplayMode.IDLE) Color.Transparent else Color.Black
+    }
+
     var cumulativeDx by remember { mutableFloatStateOf(0f) }
     var cumulativeDy by remember { mutableFloatStateOf(0f) }
 
@@ -124,18 +133,17 @@ fun IslandOverlayScreen(
         .pointerInput(displayMode, primaryPayload) {
             detectTapGestures(
                 onTap = {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                     when (displayMode) {
                         IslandDisplayMode.IDLE -> IslandStateEngine.onIdleCircleTapped()
-                        IslandDisplayMode.COMPACT_SINGLE -> IslandStateEngine.expandIsland()
-                        IslandDisplayMode.EXPANDED_CARD,
-                        IslandDisplayMode.QUICK_TOOLS -> {
-                            onRequestKeyboardFocus(false)
-                            IslandStateEngine.collapseIsland()
-                        }
+                        // Feature 2: Clicking compact pill expands the island to show controls instead of opening Spotify
+                        IslandDisplayMode.COMPACT_SINGLE,
+                        IslandDisplayMode.COMPACT_SPLIT -> IslandStateEngine.expandIsland()
                         else -> {}
                     }
                 },
                 onLongPress = {
+                    view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                     if (displayMode == IslandDisplayMode.EXPANDED_CARD ||
                         displayMode == IslandDisplayMode.QUICK_TOOLS
                     ) {
@@ -154,17 +162,19 @@ fun IslandOverlayScreen(
                     cumulativeDy = 0f
                 },
                 onDragEnd = {
-                    val isBottomToUp = cumulativeDy < -32f
-                    val isLeftToRightOrRightToLeft = abs(cumulativeDx) > 45f
-                    val isDiagonalUp = abs(cumulativeDx) > 25f && cumulativeDy < -22f
-                    val isTopToDown = cumulativeDy > 42f
+                    val isSwipeUp = cumulativeDy < -24f
+                    val isHorizontalSwipe = abs(cumulativeDx) > 45f
+                    val isDiagonalUp = abs(cumulativeDx) > 22f && cumulativeDy < -18f
+                    val isSwipeDown = cumulativeDy > 42f
 
                     when {
-                        isBottomToUp || isLeftToRightOrRightToLeft || isDiagonalUp -> {
+                        // Feature 2 & 5: Swipe up closes/collapses or moves directly to the camera punch-hole
+                        isSwipeUp || isHorizontalSwipe || isDiagonalUp -> {
+                            view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                             onRequestKeyboardFocus(false)
                             IslandStateEngine.handleDismissSwipe()
                         }
-                        isTopToDown && displayMode != IslandDisplayMode.EXPANDED_CARD -> {
+                        isSwipeDown && displayMode != IslandDisplayMode.EXPANDED_CARD -> {
                             onStatusBarSwipeDown()
                         }
                     }
@@ -180,6 +190,25 @@ fun IslandOverlayScreen(
             )
         }
 
+    // Dynamic Circumference Border Brush for Idle Camera Ring
+    val idleRingBrush = remember(primaryPayload, quickTileStates.isHotspotOn, privacyState) {
+        when {
+            privacyState.isCameraActive || privacyState.isMicActive -> {
+                Brush.linearGradient(listOf(Color(0xFF22C55E), Color(0xFFF97316)))
+            }
+            quickTileStates.isHotspotOn -> {
+                Brush.linearGradient(listOf(Color(0xFF22C55E), Color(0xFF4ADE80)))
+            }
+            primaryPayload is IslandPayload.MediaActivity -> {
+                val accent = (primaryPayload as IslandPayload.MediaActivity).accentColor
+                Brush.linearGradient(listOf(accent, Color(0xFF38BDF8)))
+            }
+            else -> {
+                Brush.linearGradient(listOf(Color(0xFF38BDF8), Color(0xFFA855F7)))
+            }
+        }
+    }
+
     if (displayMode == IslandDisplayMode.COMPACT_SPLIT) {
         Row(
             modifier = Modifier
@@ -189,14 +218,18 @@ fun IslandOverlayScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
+            // Left Primary Pill (Tapping expands the island to show song controls!)
             Box(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
                     .clip(RoundedCornerShape(50.dp))
                     .background(Color.Black)
-                    .border(0.8.dp, Color(0xFF1E293B), RoundedCornerShape(50.dp))
-                    .clickable { IslandStateEngine.expandIsland() }
+                    .border(1.dp, Color(0xFF1E293B), RoundedCornerShape(50.dp))
+                    .clickable {
+                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        IslandStateEngine.expandIsland()
+                    }
                     .padding(horizontal = 12.dp, vertical = 6.dp),
                 contentAlignment = Alignment.Center
             ) {
@@ -209,6 +242,7 @@ fun IslandOverlayScreen(
 
             Spacer(modifier = Modifier.width(8.dp))
 
+            // Detached Right Side Circle (Swaps 2nd task like Hotspot/Timer or opens Quick Tools)
             Box(
                 modifier = Modifier
                     .size(36.dp)
@@ -216,6 +250,7 @@ fun IslandOverlayScreen(
                     .background(Color.Black)
                     .border(1.dp, Color(0xFF334155), CircleShape)
                     .clickable {
+                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                         IslandStateEngine.swapPrimaryAndSecondary()
                     },
                 contentAlignment = Alignment.Center
@@ -229,22 +264,27 @@ fun IslandOverlayScreen(
                 .size(totalWidth, totalHeight)
                 .offset { burnInOffset }
                 .clip(RoundedCornerShape(cornerRadius))
-                .background(Color.Black)
+                .background(containerBgColor)
                 .border(
-                    width = if (displayMode == IslandDisplayMode.IDLE) 1.5.dp else 0.8.dp,
-                    color = if (displayMode == IslandDisplayMode.IDLE) Color(0xFF27272A) else Color(0xFF1E293B),
+                    width = if (displayMode == IslandDisplayMode.IDLE) 2.2.dp else 1.dp,
+                    brush = if (displayMode == IslandDisplayMode.IDLE) {
+                        idleRingBrush
+                    } else {
+                        SolidColor(Color(0xFF1E293B))
+                    },
                     shape = RoundedCornerShape(cornerRadius)
                 )
                 .then(gestureModifier)
                 .padding(
-                    horizontal = if (displayMode == IslandDisplayMode.IDLE) 4.dp else 12.dp,
-                    vertical = if (displayMode == IslandDisplayMode.IDLE) 4.dp else 8.dp
+                    horizontal = if (displayMode == IslandDisplayMode.IDLE) 0.dp else 12.dp,
+                    vertical = if (displayMode == IslandDisplayMode.IDLE) 0.dp else 8.dp
                 ),
             contentAlignment = Alignment.Center
         ) {
             when (displayMode) {
                 IslandDisplayMode.IDLE -> {
-                    IdlePunchHoleCircle(privacyState = privacyState)
+                    // Feature 1: Hollow circumference only — no solid black interior
+                    IdleHollowCircumference(privacyState = privacyState)
                 }
 
                 IslandDisplayMode.COMPACT_SINGLE -> {
@@ -261,6 +301,10 @@ fun IslandOverlayScreen(
                         onCollapse = {
                             onRequestKeyboardFocus(false)
                             IslandStateEngine.collapseIsland()
+                        },
+                        onMinimizeToHole = {
+                            onRequestKeyboardFocus(false)
+                            IslandStateEngine.minimizeToIdle()
                         },
                         onOpenQuickTools = {
                             IslandStateEngine.openQuickTools()
@@ -288,6 +332,8 @@ fun IslandOverlayScreen(
                         onToggleBluetooth = onToggleBluetooth,
                         onToggleHotspot = onToggleHotspot,
                         onToggleAutoRotate = onToggleAutoRotate,
+                        onToggleRingerMode = onToggleRingerMode,
+                        onSetVolumeFraction = onSetVolumeFraction,
                         onPasteText = { text ->
                             onPasteTextToFocusedApp(text)
                             IslandStateEngine.collapseIsland()
@@ -303,8 +349,33 @@ fun IslandOverlayScreen(
 }
 
 @Composable
+private fun IdleHollowCircumference(privacyState: PrivacyIndicatorState) {
+    // Interior remains 100% transparent so only the outer circumference border ring is visible
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.TopEnd
+    ) {
+        if (privacyState.isCameraActive || privacyState.isMicActive) {
+            PrivacyDotsRow(privacyState)
+        }
+    }
+}
+
+@Composable
 private fun SideCircleContent(secondaryPayload: IslandPayload?) {
     when (secondaryPayload) {
+        is IslandPayload.SystemAlert -> {
+            Icon(
+                imageVector = if (secondaryPayload.iconType == AlertIconType.HOTSPOT) {
+                    Icons.Default.WifiTethering
+                } else {
+                    Icons.Default.Notifications
+                },
+                contentDescription = null,
+                tint = secondaryPayload.accentColor,
+                modifier = Modifier.size(18.dp)
+            )
+        }
         is IslandPayload.LiveProgressActivity -> {
             if (secondaryPayload.appIcon != null) {
                 Image(
@@ -357,16 +428,6 @@ private fun SideCircleContent(secondaryPayload: IslandPayload?) {
 }
 
 @Composable
-private fun IdlePunchHoleCircle(privacyState: PrivacyIndicatorState) {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.CenterEnd
-    ) {
-        PrivacyDotsRow(privacyState)
-    }
-}
-
-@Composable
 private fun PrivacyDotsRow(privacyState: PrivacyIndicatorState) {
     Row(
         horizontalArrangement = Arrangement.spacedBy(3.dp),
@@ -411,6 +472,7 @@ private fun CompactSingleView(
                         AlertIconType.RINGER_SILENT -> Icons.Default.VolumeOff
                         AlertIconType.RINGER_VIBRATE -> Icons.Default.Vibration
                         AlertIconType.TORCH -> Icons.Default.FlashlightOn
+                        AlertIconType.HOTSPOT -> Icons.Default.WifiTethering
                         else -> Icons.Default.Notifications
                     },
                     contentDescription = null,
@@ -421,13 +483,15 @@ private fun CompactSingleView(
                             onToggleTorch()
                         }
                 )
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = if (payload.subtitle.isNotBlank()) "${payload.title} • ${payload.subtitle}" else payload.title,
                     color = Color.White,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
             }
 
@@ -530,13 +594,13 @@ private fun CompactSingleView(
             }
 
             is IslandPayload.OriginAiSuggestion -> {
-                val itemContext = LocalContext.current
+                val context = LocalContext.current
                 val firstApp = payload.targetApps.firstOrNull()
                 Row(
                     modifier = Modifier
                         .fillMaxSize()
                         .clickable {
-                            payload.primaryIntent?.let { itemContext.startActivity(it) }
+                            payload.primaryIntent?.let { context.startActivity(it) }
                             IslandStateEngine.removePayload(payload.id)
                         },
                     verticalAlignment = Alignment.CenterVertically,
@@ -587,6 +651,7 @@ private fun CompactSingleView(
 private fun ExpandedIslandCard(
     payload: IslandPayload,
     onCollapse: () -> Unit,
+    onMinimizeToHole: () -> Unit,
     onOpenQuickTools: () -> Unit,
     onRequestKeyboardFocus: (Boolean) -> Unit
 ) {
@@ -610,7 +675,7 @@ private fun ExpandedIslandCard(
                             bitmap = payload.albumArt.asImageBitmap(),
                             contentDescription = null,
                             modifier = Modifier
-                                .size(52.dp)
+                                .size(50.dp)
                                 .clip(RoundedCornerShape(14.dp))
                                 .clickable {
                                     launchPayloadIntent(context, payload)
@@ -619,14 +684,7 @@ private fun ExpandedIslandCard(
                         )
                     }
                     Spacer(modifier = Modifier.width(10.dp))
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable {
-                                launchPayloadIntent(context, payload)
-                                onCollapse()
-                            }
-                    ) {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = payload.trackTitle,
                             color = Color.White,
@@ -643,10 +701,30 @@ private fun ExpandedIslandCard(
                             overflow = TextOverflow.Ellipsis
                         )
                     }
+                    // Open Spotify App Explicitly Button
+                    IconButton(
+                        onClick = {
+                            launchPayloadIntent(context, payload)
+                            onCollapse()
+                        },
+                        modifier = Modifier
+                            .size(30.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFF1E293B))
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.OpenInNew,
+                            contentDescription = null,
+                            tint = payload.accentColor,
+                            modifier = Modifier.size(15.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    // Quick Tools Button
                     IconButton(
                         onClick = onOpenQuickTools,
                         modifier = Modifier
-                            .size(32.dp)
+                            .size(30.dp)
                             .clip(CircleShape)
                             .background(Color(0xFF1E293B))
                     ) {
@@ -654,14 +732,15 @@ private fun ExpandedIslandCard(
                             imageVector = Icons.Default.Tune,
                             contentDescription = null,
                             tint = Color(0xFF38BDF8),
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                     }
                     Spacer(modifier = Modifier.width(6.dp))
+                    // Collapse to Pill Button
                     IconButton(
                         onClick = onCollapse,
                         modifier = Modifier
-                            .size(32.dp)
+                            .size(30.dp)
                             .clip(CircleShape)
                             .background(Color(0xFF1E293B))
                     ) {
@@ -674,35 +753,109 @@ private fun ExpandedIslandCard(
                     }
                 }
 
-                LinearProgressIndicator(
-                    progress = { payload.progress },
+                // Interactive Scrubbing / Seek Slider
+                Slider(
+                    value = payload.progress,
+                    onValueChange = { newFraction ->
+                        if (payload.durationMs > 0L) {
+                            payload.onSeekTo?.invoke((newFraction * payload.durationMs).toLong())
+                        }
+                    },
+                    colors = SliderDefaults.colors(
+                        thumbColor = payload.accentColor,
+                        activeTrackColor = payload.accentColor,
+                        inactiveTrackColor = Color(0xFF334155)
+                    ),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(5.dp)
-                        .clip(RoundedCornerShape(50)),
-                    color = payload.accentColor,
-                    trackColor = Color.DarkGray
+                        .height(22.dp)
                 )
 
+                // Song Transport Control Buttons + Hide to Camera Hole Button
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = { payload.onPrevious?.invoke() }) {
-                        Icon(Icons.Default.SkipPrevious, contentDescription = null, tint = Color.White, modifier = Modifier.size(28.dp))
+                        Icon(
+                            Icons.Default.SkipPrevious,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(30.dp)
+                        )
                     }
                     IconButton(onClick = { payload.onPlayPause?.invoke() }) {
                         Icon(
                             if (payload.isPlaying) Icons.Default.PauseCircleFilled else Icons.Default.PlayCircleFilled,
                             contentDescription = null,
                             tint = Color.White,
-                            modifier = Modifier.size(42.dp)
+                            modifier = Modifier.size(44.dp)
                         )
                     }
                     IconButton(onClick = { payload.onNext?.invoke() }) {
-                        Icon(Icons.Default.SkipNext, contentDescription = null, tint = Color.White, modifier = Modifier.size(28.dp))
+                        Icon(
+                            Icons.Default.SkipNext,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(30.dp)
+                        )
                     }
+                    IconButton(onClick = onMinimizeToHole) {
+                        Icon(
+                            Icons.Default.VisibilityOff,
+                            contentDescription = null,
+                            tint = Color.Gray,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+            }
+
+            is IslandPayload.SystemAlert -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = if (payload.iconType == AlertIconType.HOTSPOT) {
+                                Icons.Default.WifiTethering
+                            } else {
+                                Icons.Default.Notifications
+                            },
+                            contentDescription = null,
+                            tint = payload.accentColor,
+                            modifier = Modifier.size(28.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = payload.title,
+                                color = Color.White,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            if (payload.subtitle.isNotBlank()) {
+                                Text(
+                                    text = payload.subtitle,
+                                    color = payload.accentColor,
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+                    }
+                    IconButton(onClick = onCollapse) {
+                        Icon(Icons.Default.KeyboardArrowUp, contentDescription = null, tint = Color.White)
+                    }
+                }
+                Button(
+                    onClick = onOpenQuickTools,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Open Quick Toggles", color = Color.White)
                 }
             }
 
@@ -841,7 +994,6 @@ private fun ExpandedIslandCard(
             }
 
             is IslandPayload.OriginAiSuggestion -> {
-                val suggestionContext = LocalContext.current
                 Text(
                     text = payload.extractedText,
                     color = Color.White,
@@ -852,7 +1004,7 @@ private fun ExpandedIslandCard(
                 OriginDragAppsDock(
                     targetApps = payload.targetApps,
                     onAppClick = { app ->
-                        suggestionContext.startActivity(app.launchIntent)
+                        context.startActivity(app.launchIntent)
                         onCollapse()
                     }
                 )
@@ -875,7 +1027,7 @@ private fun OriginDragAppsDock(
         horizontalArrangement = Arrangement.SpaceEvenly,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        targetApps.forEach { app: TargetAppInfo ->
+        targetApps.forEach { app ->
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
@@ -902,6 +1054,9 @@ private fun OriginDragAppsDock(
     }
 }
 
+/**
+ * Feature 3: Direct Action Quick Settings Dock (Toggles ON/OFF directly inside the island)
+ */
 @Composable
 private fun IdleQuickToolsDock(
     quickTileStates: QuickTileStates,
@@ -911,55 +1066,122 @@ private fun IdleQuickToolsDock(
     onToggleBluetooth: () -> Unit,
     onToggleHotspot: () -> Unit,
     onToggleAutoRotate: () -> Unit,
+    onToggleRingerMode: () -> Unit,
+    onSetVolumeFraction: (Float) -> Unit,
     onPasteText: (String) -> Unit,
     onClose: () -> Unit
 ) {
+    val view = LocalView.current
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(6.dp),
         verticalArrangement = Arrangement.SpaceBetween
     ) {
+        // Row 1: 5 Direct ON/OFF Hardware Toggles + Close Button
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly,
+            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             QuickSettingCircleTile(
                 icon = if (quickTileStates.isTorchOn) Icons.Default.FlashlightOn else Icons.Default.FlashlightOff,
+                label = if (quickTileStates.isTorchOn) "ON" else "OFF",
                 isActive = quickTileStates.isTorchOn,
                 activeColor = Color(0xFFFACC15),
-                onClick = onToggleTorch
+                onClick = {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    onToggleTorch()
+                }
             )
             QuickSettingCircleTile(
                 icon = if (quickTileStates.isBluetoothOn) Icons.Default.BluetoothConnected else Icons.Default.Bluetooth,
+                label = if (quickTileStates.isBluetoothOn) "ON" else "OFF",
                 isActive = quickTileStates.isBluetoothOn,
                 activeColor = Color(0xFF38BDF8),
-                onClick = onToggleBluetooth
+                onClick = {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    onToggleBluetooth()
+                }
             )
             QuickSettingCircleTile(
                 icon = Icons.Default.WifiTethering,
-                isActive = false,
+                label = if (quickTileStates.isHotspotOn) "ON" else "OFF",
+                isActive = quickTileStates.isHotspotOn,
                 activeColor = Color(0xFF22C55E),
-                onClick = onToggleHotspot
+                onClick = {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    onToggleHotspot()
+                }
             )
             QuickSettingCircleTile(
                 icon = if (quickTileStates.isAutoRotateOn) Icons.Default.ScreenRotation else Icons.Default.ScreenLockPortrait,
+                label = if (quickTileStates.isAutoRotateOn) "ON" else "OFF",
                 isActive = quickTileStates.isAutoRotateOn,
                 activeColor = Color(0xFFA855F7),
-                onClick = onToggleAutoRotate
+                onClick = {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    onToggleAutoRotate()
+                }
+            )
+            QuickSettingCircleTile(
+                icon = when (quickTileStates.ringerMode) {
+                    AudioManager.RINGER_MODE_SILENT -> Icons.Default.VolumeOff
+                    AudioManager.RINGER_MODE_VIBRATE -> Icons.Default.Vibration
+                    else -> Icons.Default.VolumeUp
+                },
+                label = when (quickTileStates.ringerMode) {
+                    AudioManager.RINGER_MODE_SILENT -> "Mute"
+                    AudioManager.RINGER_MODE_VIBRATE -> "Vib"
+                    else -> "Ring"
+                },
+                isActive = quickTileStates.ringerMode != AudioManager.RINGER_MODE_SILENT,
+                activeColor = Color(0xFFF97316),
+                onClick = {
+                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    onToggleRingerMode()
+                }
             )
             IconButton(
                 onClick = onClose,
                 modifier = Modifier
-                    .size(34.dp)
+                    .size(32.dp)
                     .clip(CircleShape)
                     .background(Color(0xFF1E293B))
             ) {
-                Icon(Icons.Default.Close, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(18.dp))
+                Icon(Icons.Default.Close, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(16.dp))
             }
         }
 
+        // Row 2: Direct In-Island Volume Control Bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.Default.VolumeUp,
+                contentDescription = null,
+                tint = Color(0xFF38BDF8),
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Slider(
+                value = quickTileStates.volumeFraction,
+                onValueChange = onSetVolumeFraction,
+                colors = SliderDefaults.colors(
+                    thumbColor = Color(0xFF38BDF8),
+                    activeTrackColor = Color(0xFF38BDF8),
+                    inactiveTrackColor = Color(0xFF1E293B)
+                ),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(20.dp)
+            )
+        }
+
+        // Row 3: Clipboard & Stash Quick Paste Chips
         if (clipboardHistory.isNotEmpty() || stashItems.isNotEmpty()) {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(clipboardHistory) { clipText ->
@@ -968,10 +1190,10 @@ private fun IdleQuickToolsDock(
                             .clip(RoundedCornerShape(14.dp))
                             .background(Color(0xFF1E293B))
                             .clickable { onPasteText(clipText) }
-                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
                     ) {
                         Text(
-                            text = clipText.take(32),
+                            text = clipText.take(30),
                             color = Color.White,
                             fontSize = 11.sp,
                             maxLines = 1
@@ -985,10 +1207,10 @@ private fun IdleQuickToolsDock(
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(Color(0xFF312E81))
                                 .clickable { onPasteText(text) }
-                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
                         ) {
                             Text(
-                                text = text.take(32),
+                                text = text.take(30),
                                 color = Color.White,
                                 fontSize = 11.sp,
                                 maxLines = 1
@@ -1004,28 +1226,40 @@ private fun IdleQuickToolsDock(
 @Composable
 private fun QuickSettingCircleTile(
     icon: ImageVector,
+    label: String,
     isActive: Boolean,
     activeColor: Color,
     onClick: () -> Unit
 ) {
-    Box(
-        modifier = Modifier
-            .size(50.dp)
-            .clip(CircleShape)
-            .background(if (isActive) activeColor.copy(alpha = 0.22f) else Color(0xFF1E293B))
-            .border(
-                width = 1.dp,
-                color = if (isActive) activeColor else Color(0xFF334155),
-                shape = CircleShape
-            )
-            .clickable { onClick() },
-        contentAlignment = Alignment.Center
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.clickable { onClick() }
     ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = if (isActive) activeColor else Color.White,
-            modifier = Modifier.size(24.dp)
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(CircleShape)
+                .background(if (isActive) activeColor.copy(alpha = 0.24f) else Color(0xFF1E293B))
+                .border(
+                    width = 1.2.dp,
+                    color = if (isActive) activeColor else Color(0xFF334155),
+                    shape = CircleShape
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = if (isActive) activeColor else Color.White,
+                modifier = Modifier.size(21.dp)
+            )
+        }
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(
+            text = label,
+            color = if (isActive) activeColor else Color.Gray,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold
         )
     }
 }
@@ -1085,9 +1319,7 @@ private fun launchPayloadIntent(context: Context, payload: IslandPayload) {
                     }
                 }
             }
-            is IslandPayload.CommunicationActivity -> {
-                payload.acceptIntent?.send()
-            }
+            is IslandPayload.CommunicationActivity -> payload.contentIntent?.send()
             is IslandPayload.LiveProgressActivity -> payload.contentIntent?.send()
             is IslandPayload.OriginAiSuggestion -> payload.primaryIntent?.let { context.startActivity(it) }
             else -> {}

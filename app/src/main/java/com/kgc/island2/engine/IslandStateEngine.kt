@@ -10,7 +10,7 @@ import kotlin.math.sin
 
 object IslandStateEngine {
 
-    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private val _primarySlot = MutableStateFlow<IslandPayload>(IslandPayload.Idle)
     val primarySlot: StateFlow<IslandPayload> = _primarySlot.asStateFlow()
@@ -20,6 +20,7 @@ object IslandStateEngine {
 
     private val _displayMode = MutableStateFlow(IslandDisplayMode.IDLE)
     val displayMode: StateFlow<IslandDisplayMode> = _displayMode.asStateFlow()
+
     private val _privacyState = MutableStateFlow(PrivacyIndicatorState())
     val privacyState: StateFlow<PrivacyIndicatorState> = _privacyState.asStateFlow()
 
@@ -46,6 +47,7 @@ object IslandStateEngine {
     private var autoDismissJob: Job? = null
     private var burnInJob: Job? = null
     private var isUserMinimized = false
+    private var lastTrackTitle: String? = null
 
     init {
         startBurnInProtectionLoop()
@@ -56,15 +58,21 @@ object IslandStateEngine {
             when (payload) {
                 is IslandPayload.SystemAlert,
                 is IslandPayload.OriginAiSuggestion -> {
-                    val previousPrimary = _primarySlot.value
-                    _primarySlot.value = payload
-                    _displayMode.value = IslandDisplayMode.COMPACT_SINGLE
+                    if (payload.isOngoing) {
+                        isUserMinimized = false
+                        ongoingTasks[payload.id] = payload
+                        recalculateSlots()
+                    } else {
+                        val previousPrimary = _primarySlot.value
+                        _primarySlot.value = payload
+                        _displayMode.value = IslandDisplayMode.COMPACT_SINGLE
 
-                    autoDismissJob?.cancel()
-                    val timeout = if (payload is IslandPayload.SystemAlert) payload.autoDismissMs else 5000L
-                    autoDismissJob = launch {
-                        delay(timeout)
-                        restoreOngoingState(previousPrimary)
+                        autoDismissJob?.cancel()
+                        val timeout = payload.autoDismissMs ?: 3500L
+                        autoDismissJob = launch {
+                            delay(timeout)
+                            restoreOngoingState(previousPrimary)
+                        }
                     }
                 }
 
@@ -85,7 +93,15 @@ object IslandStateEngine {
                     }
                 }
 
-                is IslandPayload.MediaActivity,
+                is IslandPayload.MediaActivity -> {
+                    if (lastTrackTitle != payload.trackTitle) {
+                        lastTrackTitle = payload.trackTitle
+                        isUserMinimized = false
+                    }
+                    ongoingTasks[payload.id] = payload
+                    recalculateSlots()
+                }
+
                 is IslandPayload.LiveProgressActivity -> {
                     val isNewTask = !ongoingTasks.containsKey(payload.id)
                     if (isNewTask) isUserMinimized = false
@@ -102,6 +118,7 @@ object IslandStateEngine {
 
     fun removePayload(id: String) {
         ongoingTasks.remove(id)
+        if (id == "media_session") lastTrackTitle = null
         if (ongoingTasks.isEmpty()) isUserMinimized = false
         recalculateSlots()
     }
@@ -139,7 +156,6 @@ object IslandStateEngine {
                 } else if (_displayMode.value != IslandDisplayMode.EXPANDED_CARD &&
                     _displayMode.value != IslandDisplayMode.QUICK_TOOLS
                 ) {
-                    // Always show the side circle beside Spotify / active task
                     _displayMode.value = IslandDisplayMode.COMPACT_SPLIT
                 }
             }
@@ -157,9 +173,6 @@ object IslandStateEngine {
         }
     }
 
-    /**
-     * Swaps the primary pill task and the secondary side-circle task when the user taps the side circle
-     */
     fun swapPrimaryAndSecondary() {
         val currentPrimary = _primarySlot.value
         val currentSecondary = _secondarySlot.value
@@ -169,12 +182,12 @@ object IslandStateEngine {
                 is IslandPayload.MediaActivity -> currentSecondary.copy(timestamp = now + 10)
                 is IslandPayload.LiveProgressActivity -> currentSecondary.copy(timestamp = now + 10)
                 is IslandPayload.CommunicationActivity -> currentSecondary.copy(timestamp = now + 10)
+                is IslandPayload.SystemAlert -> currentSecondary.copy(timestamp = now + 10)
                 else -> currentSecondary
             }
             ongoingTasks[updatedSecondary.id] = updatedSecondary
             recalculateSlots()
         } else {
-            // If only 1 task (e.g., Spotify) is running, tapping the side circle opens Quick Tools
             _displayMode.value = IslandDisplayMode.QUICK_TOOLS
         }
     }
@@ -197,7 +210,6 @@ object IslandStateEngine {
 
     fun onIdleCircleTapped() {
         if (isUserMinimized && ongoingTasks.isNotEmpty()) {
-            // Restore minimized Spotify/task back to split pill
             isUserMinimized = false
             recalculateSlots()
         } else {
@@ -222,10 +234,11 @@ object IslandStateEngine {
         recalculateSlots()
     }
 
-    /**
-     * Triggered by Left-to-Right, Diagonal, or Bottom-to-Up swipe:
-     * If expanded, collapses to pill; if compact pill, tucks into the camera punch-hole circle while Spotify keeps playing.
-     */
+    fun minimizeToIdle() {
+        isUserMinimized = true
+        _displayMode.value = IslandDisplayMode.IDLE
+    }
+
     fun handleDismissSwipe() {
         when (_displayMode.value) {
             IslandDisplayMode.EXPANDED_CARD,
@@ -235,8 +248,7 @@ object IslandStateEngine {
             }
             IslandDisplayMode.COMPACT_SINGLE,
             IslandDisplayMode.COMPACT_SPLIT -> {
-                isUserMinimized = true
-                _displayMode.value = IslandDisplayMode.IDLE
+                minimizeToIdle()
             }
             IslandDisplayMode.IDLE -> {}
         }
@@ -251,6 +263,7 @@ object IslandStateEngine {
         }
     }
 
+    // Both method names supported so neither AccessibilityService nor other files fail:
     fun updatePrivacyDots(camera: Boolean? = null, mic: Boolean? = null) {
         _privacyState.update {
             it.copy(
@@ -260,19 +273,43 @@ object IslandStateEngine {
         }
     }
 
-    fun updateQuickTileState(torch: Boolean? = null, bluetooth: Boolean? = null, autoRotate: Boolean? = null) {
+    fun updatePrivacyState(camera: Boolean? = null, mic: Boolean? = null) =
+        updatePrivacyDots(camera, mic)
+
+    fun updateQuickTileState(
+        torch: Boolean? = null,
+        bluetooth: Boolean? = null,
+        hotspot: Boolean? = null,
+        autoRotate: Boolean? = null,
+        ringerMode: Int? = null,
+        volumeFraction: Float? = null
+    ) {
         _quickTileStates.update {
             it.copy(
                 isTorchOn = torch ?: it.isTorchOn,
                 isBluetoothOn = bluetooth ?: it.isBluetoothOn,
-                isAutoRotateOn = autoRotate ?: it.isAutoRotateOn
+                isHotspotOn = hotspot ?: it.isHotspotOn,
+                isAutoRotateOn = autoRotate ?: it.isAutoRotateOn,
+                ringerMode = ringerMode ?: it.ringerMode,
+                volumeFraction = volumeFraction ?: it.volumeFraction
             )
         }
     }
 
+    fun updateQuickTileStates(
+        torch: Boolean? = null,
+        bluetooth: Boolean? = null,
+        hotspot: Boolean? = null,
+        autoRotate: Boolean? = null,
+        ringerMode: Int? = null,
+        volumeFraction: Float? = null
+    ) = updateQuickTileState(torch, bluetooth, hotspot, autoRotate, ringerMode, volumeFraction)
+
     fun addToStash(item: StashItem) {
         _stashItems.update { (listOf(item) + it).take(10) }
     }
+
+    fun addStashItem(item: StashItem) = addToStash(item)
 
     fun recordClipboard(text: String) {
         if (text.isBlank()) return
@@ -281,8 +318,14 @@ object IslandStateEngine {
         }
     }
 
+    fun addClipboardEntry(text: String) = recordClipboard(text)
+
     fun updateCutoutConfig(config: CutoutConfig) {
         _cutoutConfig.value = config
+    }
+
+    fun updateBurnInOffset(offset: IntOffset) {
+        _burnInOffset.value = offset
     }
 
     fun onScreenPowerStateChanged(isInteractive: Boolean) {

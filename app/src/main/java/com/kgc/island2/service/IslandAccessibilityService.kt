@@ -9,7 +9,6 @@ import android.graphics.PixelFormat
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.media.AudioRecordingConfiguration
-import android.net.Uri
 import android.os.BatteryManager
 import android.os.Handler
 import android.os.Looper
@@ -17,6 +16,7 @@ import android.provider.Settings
 import android.view.*
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.core.net.toUri
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ComposeView
 import androidx.lifecycle.*
@@ -91,7 +91,6 @@ class IslandAccessibilityService : AccessibilityService(),
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        // Ensure overlay stays attached even when user closes all apps from Recents
         if (!isViewAttached) {
             setupOverlayWindow()
         }
@@ -368,7 +367,7 @@ class IslandAccessibilityService : AccessibilityService(),
             addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
             addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
         }
-        registerReceiver(systemEventReceiver, filter)
+        registerReceiver(systemEventReceiver, filter, RECEIVER_EXPORTED)
     }
 
     private val systemEventReceiver = object : BroadcastReceiver() {
@@ -484,7 +483,7 @@ class IslandAccessibilityService : AccessibilityService(),
         } else {
             val writeSettingsIntent = Intent(
                 Settings.ACTION_MANAGE_WRITE_SETTINGS,
-                Uri.parse("package:$packageName")
+                "package:$packageName".toUri()
             ).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }

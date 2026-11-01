@@ -36,9 +36,8 @@ object OriginAiProcessor {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 TargetAppInfo(
-                    label = info.loadLabel(pm).toString(),
                     packageName = pkg,
-                    activityName = cls,
+                    label = info.loadLabel(pm).toString(),
                     icon = info.loadIcon(pm),
                     launchIntent = specificIntent
                 )
@@ -52,7 +51,7 @@ object OriginAiProcessor {
         val clean = text.trim()
         if (clean.length !in 3..400) return@withContext
 
-        IslandStateEngine.recordClipboard(clean)
+        IslandStateEngine.addClipboardEntry(clean)
 
         // 1. Direct URL Routing -> Queries real installed browsers/apps
         if (URL_REGEX.matches(clean)) {
@@ -65,10 +64,11 @@ object OriginAiProcessor {
 
             IslandStateEngine.submitPayload(
                 IslandPayload.OriginAiSuggestion(
-                    actionTitle = appName,
+                    id = "origin_ai_url",
                     extractedText = clean,
-                    targetApps = apps,
-                    primaryIntent = apps.firstOrNull()?.launchIntent ?: viewIntent
+                    actionTitle = appName,
+                    primaryIntent = apps.firstOrNull()?.launchIntent ?: viewIntent,
+                    targetApps = apps
                 )
             )
             return@withContext
@@ -84,10 +84,11 @@ object OriginAiProcessor {
 
             IslandStateEngine.submitPayload(
                 IslandPayload.OriginAiSuggestion(
-                    actionTitle = appName,
+                    id = "origin_ai_phone",
                     extractedText = clean,
-                    targetApps = apps,
-                    primaryIntent = apps.firstOrNull()?.launchIntent ?: dialIntent
+                    actionTitle = appName,
+                    primaryIntent = apps.firstOrNull()?.launchIntent ?: dialIntent,
+                    targetApps = apps
                 )
             )
             return@withContext
@@ -111,10 +112,11 @@ object OriginAiProcessor {
                                 val apps = resolveInstalledTargetApps(context, mapIntent)
                                 IslandStateEngine.submitPayload(
                                     IslandPayload.OriginAiSuggestion(
-                                        actionTitle = apps.firstOrNull()?.label ?: annotation.annotatedText,
+                                        id = "origin_ai_address",
                                         extractedText = annotation.annotatedText,
-                                        targetApps = apps,
-                                        primaryIntent = apps.firstOrNull()?.launchIntent ?: mapIntent
+                                        actionTitle = apps.firstOrNull()?.label ?: annotation.annotatedText,
+                                        primaryIntent = apps.firstOrNull()?.launchIntent ?: mapIntent,
+                                        targetApps = apps
                                     )
                                 )
                                 return@withContext
@@ -129,10 +131,11 @@ object OriginAiProcessor {
                                 val apps = resolveInstalledTargetApps(context, calIntent)
                                 IslandStateEngine.submitPayload(
                                     IslandPayload.OriginAiSuggestion(
-                                        actionTitle = apps.firstOrNull()?.label ?: annotation.annotatedText,
+                                        id = "origin_ai_date",
                                         extractedText = annotation.annotatedText,
-                                        targetApps = apps,
-                                        primaryIntent = apps.firstOrNull()?.launchIntent ?: calIntent
+                                        actionTitle = apps.firstOrNull()?.label ?: annotation.annotatedText,
+                                        primaryIntent = apps.firstOrNull()?.launchIntent ?: calIntent,
+                                        targetApps = apps
                                     )
                                 )
                                 return@withContext
@@ -156,10 +159,11 @@ object OriginAiProcessor {
         if (apps.isNotEmpty()) {
             IslandStateEngine.submitPayload(
                 IslandPayload.OriginAiSuggestion(
-                    actionTitle = apps.first().label,
+                    id = "origin_ai_share",
                     extractedText = clean,
-                    targetApps = apps,
-                    primaryIntent = apps.first().launchIntent
+                    actionTitle = apps.first().label,
+                    primaryIntent = apps.first().launchIntent,
+                    targetApps = apps
                 )
             )
         }
