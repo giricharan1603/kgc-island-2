@@ -1,7 +1,6 @@
 package com.kgc.island2
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -38,13 +37,16 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.kgc.island2.engine.IslandStateEngine
 import com.kgc.island2.model.AlertIconType
-import com.kgc.island2.model.CutoutConfig
+import com.kgc.island2.model.CircleAnimationStyle
 import com.kgc.island2.model.IslandPayload
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        IslandStateEngine.loadPersistedPreferences(this)
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 KgcIslandControlCenter()
@@ -55,41 +57,31 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun KgcIslandControlCenter() {
         val cutoutConfig by IslandStateEngine.cutoutConfig.collectAsState()
+        val pinnedPackages by IslandStateEngine.pinnedShortcutPackages.collectAsState()
         val lifecycleOwner = LocalLifecycleOwner.current
-        val prefs = remember { getSharedPreferences("kgc_island2_prefs", Context.MODE_PRIVATE) }
 
         var isAccessibilityEnabled by remember { mutableStateOf(checkAccessibilityPermission()) }
         var isNotificationEnabled by remember { mutableStateOf(checkNotificationPermission()) }
         var isWriteSettingsEnabled by remember { mutableStateOf(Settings.System.canWrite(this)) }
         var isBluetoothGranted by remember { mutableStateOf(checkBluetoothPermission()) }
         var isBatteryExempt by remember { mutableStateOf(checkBatteryOptimization()) }
+        var installedApps by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
 
-        var idleCustomText by remember { mutableStateOf(prefs.getString("idle_custom_text", "KGC ISLAND 2 | READY").orEmpty()) }
-        var isIdleTextEnabled by remember { mutableStateOf(prefs.getBoolean("idle_text_enabled", false)) }
-        var selectedThemeStyle by remember { mutableStateOf(prefs.getString("idle_theme_style", "CYBER_SWEEP").orEmpty()) }
-        var selectedColorPalette by remember { mutableStateOf(prefs.getString("idle_color_palette", "CYBER_CYAN").orEmpty()) }
-        var isLyricsEnabled by remember { mutableStateOf(prefs.getBoolean("lyrics_enabled", true)) }
-
-        val themeOptions = remember {
-            listOf(
-                "CYBER_SWEEP" to "Cyber Neon Sweep",
-                "RGB_CHROMA" to "RGB Gaming Chroma",
-                "DUAL_SCANNER" to "Sci-Fi Dual Scanner",
-                "STARLIGHT" to "Starlight Orbit Dots",
-                "PULSE_GLOW" to "Breathing Pulse Aura",
-                "STEALTH_STATIC" to "Minimal Stealth Ring"
-            )
-        }
-
-        val paletteOptions = remember {
-            listOf(
-                "CYBER_CYAN" to "Cyber Cyan",
-                "SUNSET_GOLD" to "Sunset Gold",
-                "MATRIX_EMERALD" to "Matrix Emerald",
-                "CRIMSON_BLAZE" to "Crimson Blaze",
-                "ROYAL_AMETHYST" to "Royal Amethyst",
-                "MONO_SILVER" to "Monochrome Silver"
-            )
+        LaunchedEffect(Unit) {
+            installedApps = withContext(Dispatchers.IO) {
+                val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                }
+                packageManager.queryIntentActivities(mainIntent, 0)
+                    .mapNotNull { info ->
+                        val pkg = info.activityInfo.packageName
+                        if (pkg == packageName) return@mapNotNull null
+                        val label = info.loadLabel(packageManager).toString()
+                        Pair(label, pkg)
+                    }
+                    .distinctBy { it.second }
+                    .sortedBy { it.first.lowercase() }
+            }
         }
 
         val btPermissionLauncher = rememberLauncherForActivityResult(
@@ -128,12 +120,12 @@ class MainActivity : ComponentActivity() {
                 fontWeight = FontWeight.ExtraBold
             )
             Text(
-                text = "Idle Text Roll-Down • Live Song Lyrics • 6 Ring Themes",
+                text = "Hold & Drag • 5 Circle Styles • Custom App Dock",
                 color = Color(0xFF38BDF8),
                 fontSize = 13.sp
             )
 
-            // 1. System Permissions
+            // 1. Permissions Card
             Card(
                 shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
@@ -165,7 +157,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            // 2. Idle Roll-Down Text & Live Song Lyrics Card
+            // 2. Circle Animation Style Selector Card
             Card(
                 shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
@@ -175,131 +167,41 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text("2. Idle Roll-Down Text & Live Lyrics", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Text("2. Camera Circle Animation Style", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Show Roll-Down Text When Idle", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                            Text("Tip: Separate phrases with | to roll between them!", color = Color.Gray, fontSize = 11.sp)
-                        }
-                        Switch(
-                            checked = isIdleTextEnabled,
-                            onCheckedChange = { enabled ->
-                                isIdleTextEnabled = enabled
-                                prefs.edit()
-                                    .putBoolean("idle_text_enabled", enabled)
-                                    .putString("idle_custom_text", idleCustomText)
-                                    .apply()
-                            }
-                        )
-                    }
-
-                    OutlinedTextField(
-                        value = idleCustomText,
-                        onValueChange = { newText ->
-                            idleCustomText = newText
-                            prefs.edit().putString("idle_custom_text", newText).apply()
-                        },
-                        label = { Text("Enter Idle Roll-Down Text (e.g. GIRI | STAY FOCUSED)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    HorizontalDivider(color = Color(0xFF334155))
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Live Synchronized Song Lyrics", color = Color(0xFF4ADE80), fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                            Text("Automatically rolls down synced song lyrics in Spotify/Music", color = Color.Gray, fontSize = 11.sp)
-                        }
-                        Switch(
-                            checked = isLyricsEnabled,
-                            onCheckedChange = { enabled ->
-                                isLyricsEnabled = enabled
-                                prefs.edit().putBoolean("lyrics_enabled", enabled).apply()
-                            }
-                        )
-                    }
-                }
-            }
-
-            // 3. Idle Ring Themes & Colour Palettes Card
-            Card(
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text("3. Idle Camera Ring Themes & Colours", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-
-                    Text("Select Ring Animation:", color = Color(0xFF38BDF8), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    themeOptions.forEach { (key, label) ->
-                        val isSelected = selectedThemeStyle == key
+                    CircleAnimationStyle.entries.forEach { style ->
+                        val selected = cutoutConfig.circleAnimationStyle == style
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
-                                .background(if (isSelected) Color(0xFF0284C7).copy(alpha = 0.3f) else Color(0xFF0F172A))
+                                .background(if (selected) Color(0xFF0284C7).copy(alpha = 0.3f) else Color(0xFF0F172A))
                                 .clickable {
-                                    selectedThemeStyle = key
-                                    prefs.edit().putString("idle_theme_style", key).apply()
+                                    IslandStateEngine.saveCutoutConfigToPrefs(
+                                        this@MainActivity,
+                                        cutoutConfig.copy(circleAnimationStyle = style)
+                                    )
                                 }
-                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(label, color = Color.White, fontSize = 13.sp)
+                            Text(style.label, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                             RadioButton(
-                                selected = isSelected,
+                                selected = selected,
                                 onClick = {
-                                    selectedThemeStyle = key
-                                    prefs.edit().putString("idle_theme_style", key).apply()
+                                    IslandStateEngine.saveCutoutConfigToPrefs(
+                                        this@MainActivity,
+                                        cutoutConfig.copy(circleAnimationStyle = style)
+                                    )
                                 }
                             )
                         }
-                    }
-
-                    Text("Select Colour Palette:", color = Color(0xFF38BDF8), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(paletteOptions) { (key, label) ->
-                            FilterChip(
-                                selected = selectedColorPalette == key,
-                                onClick = {
-                                    selectedColorPalette = key
-                                    prefs.edit().putString("idle_color_palette", key).apply()
-                                },
-                                label = { Text(label) }
-                            )
-                        }
-                    }
-
-                    Button(
-                        onClick = {
-                            prefs.edit()
-                                .putLong("edge_flash_color", 0xFF25D366L)
-                                .putLong("edge_flash_timestamp", System.currentTimeMillis())
-                                .apply()
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF25D366)),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Test Edge-Light Notification Flash", color = Color.Black, fontWeight = FontWeight.Bold)
                     }
                 }
             }
 
-            // 4. Hold & Drag Position Calibration Card
+            // 3. Hold & Drag + Cutout Calibration + Charging Duration Card
             Card(
                 shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
@@ -309,16 +211,37 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("4. Hold & Drag Position Calibration", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Text("Tip: Long-press & drag the camera ring directly on your screen!", color = Color(0xFF38BDF8), fontSize = 12.sp)
+                    Text("3. Hold & Drag Position & Timing", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Touch, Hold & Drag Island", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Long-press & drag the island in Portrait or Landscape", color = Color.Gray, fontSize = 11.sp)
+                        }
+                        Switch(
+                            checked = cutoutConfig.isHoldAndDragEnabled,
+                            onCheckedChange = { enabled ->
+                                IslandStateEngine.saveCutoutConfigToPrefs(
+                                    this@MainActivity,
+                                    cutoutConfig.copy(isHoldAndDragEnabled = enabled)
+                                )
+                            }
+                        )
+                    }
 
                     Text("Portrait Offset X: ${cutoutConfig.offsetX} px", color = Color.LightGray, fontSize = 12.sp)
                     Slider(
                         value = cutoutConfig.offsetX.toFloat(),
                         onValueChange = {
-                            val updated = cutoutConfig.copy(offsetX = it.toInt())
-                            IslandStateEngine.updateCutoutConfig(updated)
-                            saveCalibrationPrefs(updated, customPort = true)
+                            IslandStateEngine.saveCutoutConfigToPrefs(
+                                this@MainActivity,
+                                cutoutConfig.copy(offsetX = it.toInt()),
+                                isCustomPort = true
+                            )
                         },
                         valueRange = -300f..300f
                     )
@@ -327,9 +250,11 @@ class MainActivity : ComponentActivity() {
                     Slider(
                         value = cutoutConfig.offsetY.toFloat(),
                         onValueChange = {
-                            val updated = cutoutConfig.copy(offsetY = it.toInt())
-                            IslandStateEngine.updateCutoutConfig(updated)
-                            saveCalibrationPrefs(updated, customPort = true)
+                            IslandStateEngine.saveCutoutConfigToPrefs(
+                                this@MainActivity,
+                                cutoutConfig.copy(offsetY = it.toInt()),
+                                isCustomPort = true
+                            )
                         },
                         valueRange = -20f..250f
                     )
@@ -338,9 +263,11 @@ class MainActivity : ComponentActivity() {
                     Slider(
                         value = cutoutConfig.landscapeCutoutX.toFloat(),
                         onValueChange = {
-                            val updated = cutoutConfig.copy(landscapeCutoutX = it.toInt())
-                            IslandStateEngine.updateCutoutConfig(updated)
-                            saveCalibrationPrefs(updated, customLand = true)
+                            IslandStateEngine.saveCutoutConfigToPrefs(
+                                this@MainActivity,
+                                cutoutConfig.copy(landscapeCutoutX = it.toInt()),
+                                isCustomLand = true
+                            )
                         },
                         valueRange = -200f..400f
                     )
@@ -349,9 +276,11 @@ class MainActivity : ComponentActivity() {
                     Slider(
                         value = cutoutConfig.landscapeCutoutY.toFloat(),
                         onValueChange = {
-                            val updated = cutoutConfig.copy(landscapeCutoutY = it.toInt())
-                            IslandStateEngine.updateCutoutConfig(updated)
-                            saveCalibrationPrefs(updated, customLand = true)
+                            IslandStateEngine.saveCutoutConfigToPrefs(
+                                this@MainActivity,
+                                cutoutConfig.copy(landscapeCutoutY = it.toInt()),
+                                isCustomLand = true
+                            )
                         },
                         valueRange = -300f..300f
                     )
@@ -361,28 +290,35 @@ class MainActivity : ComponentActivity() {
                         value = cutoutConfig.idleCircleSizeDp.toFloat(),
                         onValueChange = {
                             val size = it.toInt()
-                            val updated = cutoutConfig.copy(
-                                baseWidthDp = size,
-                                baseHeightDp = size,
-                                idleCircleSizeDp = size
+                            IslandStateEngine.saveCutoutConfigToPrefs(
+                                this@MainActivity,
+                                cutoutConfig.copy(
+                                    baseWidthDp = size,
+                                    baseHeightDp = size,
+                                    idleCircleSizeDp = size
+                                )
                             )
-                            IslandStateEngine.updateCutoutConfig(updated)
-                            saveCalibrationPrefs(updated)
                         },
                         valueRange = 20f..56f
+                    )
+
+                    val chargeSec = (cutoutConfig.chargingDurationMs / 1000f)
+                    Text("Charging Animation Duration: ${"%.1f".format(chargeSec)} sec (5–8s)", color = Color(0xFF4ADE80), fontSize = 12.sp)
+                    Slider(
+                        value = cutoutConfig.chargingDurationMs.toFloat(),
+                        onValueChange = {
+                            IslandStateEngine.saveCutoutConfigToPrefs(
+                                this@MainActivity,
+                                cutoutConfig.copy(chargingDurationMs = it.toLong())
+                            )
+                        },
+                        valueRange = 5000f..8000f
                     )
 
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Button(
                             onClick = {
-                                val reset = cutoutConfig.copy(
-                                    offsetX = 0,
-                                    offsetY = 10,
-                                    landscapeCutoutX = 14,
-                                    landscapeCutoutY = 0
-                                )
-                                IslandStateEngine.updateCutoutConfig(reset)
-                                saveCalibrationPrefs(reset, customPort = false, customLand = false)
+                                IslandStateEngine.resetOffsetsToHardwareCutout(this@MainActivity, 0, 10, 14, 0)
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF334155)),
                             modifier = Modifier.weight(1f)
@@ -395,41 +331,49 @@ class MainActivity : ComponentActivity() {
                                     IslandPayload.SystemAlert(
                                         id = "charging_test",
                                         title = "⚡ 88%",
-                                        subtitle = "Super Charge • 6.5s",
+                                        subtitle = "Super Charge • 3850mA",
                                         accentColor = Color(0xFF4ADE80),
                                         iconType = AlertIconType.CHARGING,
-                                        autoDismissMs = 6500L
+                                        autoDismissMs = cutoutConfig.chargingDurationMs
                                     )
                                 )
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF22C55E)),
                             modifier = Modifier.weight(1f)
                         ) {
-                            Text("Test 6.5s Charge", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Text("Test Charging", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                         }
                     }
                 }
             }
-        }
-    }
 
-    private fun saveCalibrationPrefs(
-        cfg: CutoutConfig,
-        customPort: Boolean? = null,
-        customLand: Boolean? = null
-    ) {
-        try {
-            getSharedPreferences("kgc_island2_prefs", Context.MODE_PRIVATE).edit().apply {
-                putInt("port_x", cfg.offsetX)
-                putInt("port_y", cfg.offsetY)
-                putInt("land_x", cfg.landscapeCutoutX)
-                putInt("land_y", cfg.landscapeCutoutY)
-                putInt("circle_size_dp", cfg.idleCircleSizeDp)
-                customPort?.let { putBoolean("has_custom_port", it) }
-                customLand?.let { putBoolean("has_custom_land", it) }
-                apply()
+            // 4. Pin Custom Apps to Island Dock Card
+            Card(
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("4. Pin Apps to Island Quick Dock", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    Text("Tap apps below to add/remove them inside Kgc Island (${pinnedPackages.size}/8 selected):", color = Color.Gray, fontSize = 12.sp)
+
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(installedApps) { (label, pkg) ->
+                            val isPinned = pinnedPackages.contains(pkg)
+                            FilterChip(
+                                selected = isPinned,
+                                onClick = {
+                                    IslandStateEngine.togglePinnedPackage(this@MainActivity, pkg)
+                                },
+                                label = { Text(label, maxLines = 1) }
+                            )
+                        }
+                    }
+                }
             }
-        } catch (e: Exception) {
         }
     }
 

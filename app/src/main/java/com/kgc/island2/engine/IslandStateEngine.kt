@@ -1,7 +1,7 @@
 package com.kgc.island2.engine
 
 import android.content.Context
-import android.view.Surface
+import android.content.Intent
 import androidx.compose.ui.unit.IntOffset
 import com.kgc.island2.model.*
 import kotlinx.coroutines.*
@@ -13,16 +13,16 @@ import kotlin.math.sin
 object IslandStateEngine {
 
     private const val PREFS_NAME = "kgc_island2_prefs"
-    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    private val _displayMode = MutableStateFlow(IslandDisplayMode.IDLE)
+    val displayMode: StateFlow<IslandDisplayMode> = _displayMode.asStateFlow()
 
     private val _primarySlot = MutableStateFlow<IslandPayload>(IslandPayload.Idle)
     val primarySlot: StateFlow<IslandPayload> = _primarySlot.asStateFlow()
 
     private val _secondarySlot = MutableStateFlow<IslandPayload?>(null)
     val secondarySlot: StateFlow<IslandPayload?> = _secondarySlot.asStateFlow()
-
-    private val _displayMode = MutableStateFlow(IslandDisplayMode.IDLE)
-    val displayMode: StateFlow<IslandDisplayMode> = _displayMode.asStateFlow()
 
     private val _privacyState = MutableStateFlow(PrivacyIndicatorState())
     val privacyState: StateFlow<PrivacyIndicatorState> = _privacyState.asStateFlow()
@@ -33,40 +33,29 @@ object IslandStateEngine {
     private val _cutoutConfig = MutableStateFlow(CutoutConfig())
     val cutoutConfig: StateFlow<CutoutConfig> = _cutoutConfig.asStateFlow()
 
-    private val _burnInOffset = MutableStateFlow(IntOffset(0, 0))
+    private val _burnInOffset = MutableStateFlow(IntOffset.Zero)
     val burnInOffset: StateFlow<IntOffset> = _burnInOffset.asStateFlow()
-
-    private val _stashItems = MutableStateFlow<List<StashItem>>(emptyList())
-    val stashItems: StateFlow<List<StashItem>> = _stashItems.asStateFlow()
 
     private val _clipboardHistory = MutableStateFlow<List<String>>(emptyList())
     val clipboardHistory: StateFlow<List<String>> = _clipboardHistory.asStateFlow()
 
+    private val _stashItems = MutableStateFlow<List<StashItem>>(emptyList())
+    val stashItems: StateFlow<List<StashItem>> = _stashItems.asStateFlow()
+
     private val _dragTargetApps = MutableStateFlow<List<TargetAppInfo>>(emptyList())
     val dragTargetApps: StateFlow<List<TargetAppInfo>> = _dragTargetApps.asStateFlow()
 
-    private val _pinnedShortcutPackages = MutableStateFlow<Set<String>>(
-        setOf("com.spotify.music", "com.whatsapp", "com.google.android.youtube", "com.android.chrome")
-    )
+    private val _pinnedShortcutPackages = MutableStateFlow<Set<String>>(emptySet())
     val pinnedShortcutPackages: StateFlow<Set<String>> = _pinnedShortcutPackages.asStateFlow()
 
     private val _pinnedShortcuts = MutableStateFlow<List<TargetAppInfo>>(emptyList())
     val pinnedShortcuts: StateFlow<List<TargetAppInfo>> = _pinnedShortcuts.asStateFlow()
 
-    private val _isScreenInteractive = MutableStateFlow(true)
-    val isScreenInteractive: StateFlow<Boolean> = _isScreenInteractive.asStateFlow()
-
-    private val _isFullscreenImmersive = MutableStateFlow(false)
-    val isFullscreenImmersive: StateFlow<Boolean> = _isFullscreenImmersive.asStateFlow()
-
     private val ongoingTasks = ConcurrentHashMap<String, IslandPayload>()
-    private val notificationBurstTracker = ConcurrentHashMap<String, MutableList<Long>>()
-    private var autoDismissJob: Job? = null
+    private var transientAlertJob: Job? = null
     private var burnInJob: Job? = null
-    private var isUserMinimized = false
-    private var lastTrackTitle: String? = null
-    private var hasUserCustomPortraitOffset = false
-    private var hasUserCustomLandscapeOffset = false
+    private var isUserMinimized: Boolean = false
+    private var lastKnownTrackTitle: String? = null
 
     init {
         startBurnInProtectionLoop()
@@ -75,115 +64,124 @@ object IslandStateEngine {
     fun loadPersistedPreferences(context: Context) {
         try {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            hasUserCustomPortraitOffset = prefs.getBoolean("has_custom_port", false)
-            hasUserCustomLandscapeOffset = prefs.getBoolean("has_custom_land", false)
             val styleName = prefs.getString("circle_style", CircleAnimationStyle.CYBER_SWEEP.name)
                 ?: CircleAnimationStyle.CYBER_SWEEP.name
             val style = try {
                 CircleAnimationStyle.valueOf(styleName)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 CircleAnimationStyle.CYBER_SWEEP
             }
-            val sizeDp = prefs.getInt("circle_size_dp", 30)
-            val savedPackages = prefs.getStringSet("pinned_pkgs", null)
-            if (savedPackages != null) {
-                _pinnedShortcutPackages.value = savedPackages
-            }
-
-            _cutoutConfig.update { current ->
-                current.copy(
-                    offsetX = prefs.getInt("port_x", current.offsetX),
-                    offsetY = prefs.getInt("port_y", current.offsetY),
-                    landscapeCutoutX = prefs.getInt("land_x", current.landscapeCutoutX),
-                    landscapeCutoutY = prefs.getInt("land_y", current.landscapeCutoutY),
+            val sizeDp = prefs.getInt("circle_size_dp", 34)
+            _cutoutConfig.update {
+                it.copy(
                     baseWidthDp = sizeDp,
                     baseHeightDp = sizeDp,
                     idleCircleSizeDp = sizeDp,
+                    offsetX = prefs.getInt("port_x", 0),
+                    offsetY = prefs.getInt("port_y", 10),
+                    landscapeCutoutX = prefs.getInt("land_x", 14),
+                    landscapeCutoutY = prefs.getInt("land_y", 0),
+                    hasCustomPortraitPos = prefs.getBoolean("has_custom_port", false),
+                    hasCustomLandscapePos = prefs.getBoolean("has_custom_land", false),
                     isHoldAndDragEnabled = prefs.getBoolean("hold_drag_enabled", true),
                     chargingDurationMs = prefs.getLong("charging_duration_ms", 6500L),
                     circleAnimationStyle = style
                 )
             }
-        } catch (_: Exception) {
+
+            val savedPackages = prefs.getStringSet("pinned_packages", null)
+            if (savedPackages != null) {
+                _pinnedShortcutPackages.value = savedPackages
+            }
+            refreshPinnedAppShortcuts(context)
+        } catch (e: Exception) {
         }
     }
 
     fun saveCutoutConfigToPrefs(
         context: Context,
-        config: CutoutConfig,
-        isCustomPort: Boolean = hasUserCustomPortraitOffset,
-        isCustomLand: Boolean = hasUserCustomLandscapeOffset
+        newConfig: CutoutConfig,
+        isCustomPort: Boolean? = null,
+        isCustomLand: Boolean? = null
     ) {
-        hasUserCustomPortraitOffset = isCustomPort
-        hasUserCustomLandscapeOffset = isCustomLand
-        _cutoutConfig.value = config
+        val updated = newConfig.copy(
+            hasCustomPortraitPos = isCustomPort ?: newConfig.hasCustomPortraitPos,
+            hasCustomLandscapePos = isCustomLand ?: newConfig.hasCustomLandscapePos
+        )
+        _cutoutConfig.value = updated
         commitCutoutConfigToDisk(context)
     }
 
-    /**
-     * Senior Optimization: Updates coordinates purely in RAM during 120Hz touch drag so there is ZERO disk I/O lag!
-     */
-    fun updateDraggedOffsetInMemory(deltaX: Int, deltaY: Int) {
-        val cur = _cutoutConfig.value
-        if (!cur.isHoldAndDragEnabled) return
-        val updated = if (cur.isLandscape) {
-            hasUserCustomLandscapeOffset = true
-            val nextX = if (cur.landscapeRotation == Surface.ROTATION_270) {
-                (cur.landscapeCutoutX - deltaX).coerceIn(-600, 1200)
+    fun updateDraggedOffsetInMemory(dx: Int, dy: Int) {
+        _cutoutConfig.update { current ->
+            if (current.isLandscape) {
+                val nextX = if (current.landscapeRotation == android.view.Surface.ROTATION_270) {
+                    (current.landscapeCutoutX - dx).coerceIn(-200, 400)
+                } else {
+                    (current.landscapeCutoutX + dx).coerceIn(-200, 400)
+                }
+                val nextY = (current.landscapeCutoutY + dy).coerceIn(-300, 300)
+                current.copy(
+                    landscapeCutoutX = nextX,
+                    landscapeCutoutY = nextY,
+                    hasCustomLandscapePos = true
+                )
             } else {
-                (cur.landscapeCutoutX + deltaX).coerceIn(-600, 1200)
+                current.copy(
+                    offsetX = (current.offsetX + dx).coerceIn(-300, 300),
+                    offsetY = (current.offsetY + dy).coerceIn(-20, 250),
+                    hasCustomPortraitPos = true
+                )
             }
-            val nextY = (cur.landscapeCutoutY + deltaY).coerceIn(-500, 500)
-            cur.copy(landscapeCutoutX = nextX, landscapeCutoutY = nextY)
-        } else {
-            hasUserCustomPortraitOffset = true
-            val nextX = (cur.offsetX + deltaX).coerceIn(-500, 500)
-            val nextY = (cur.offsetY + deltaY).coerceIn(-40, 800)
-            cur.copy(offsetX = nextX, offsetY = nextY)
         }
-        _cutoutConfig.value = updated
     }
 
     fun commitCutoutConfigToDisk(context: Context) {
-        val config = _cutoutConfig.value
+        val updated = _cutoutConfig.value
         try {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().apply {
-                putInt("port_x", config.offsetX)
-                putInt("port_y", config.offsetY)
-                putInt("land_x", config.landscapeCutoutX)
-                putInt("land_y", config.landscapeCutoutY)
-                putInt("circle_size_dp", config.idleCircleSizeDp)
-                putBoolean("hold_drag_enabled", config.isHoldAndDragEnabled)
-                putLong("charging_duration_ms", config.chargingDurationMs)
-                putString("circle_style", config.circleAnimationStyle.name)
-                putBoolean("has_custom_port", hasUserCustomPortraitOffset)
-                putBoolean("has_custom_land", hasUserCustomLandscapeOffset)
+                putInt("circle_size_dp", updated.idleCircleSizeDp)
+                putInt("port_x", updated.offsetX)
+                putInt("port_y", updated.offsetY)
+                putInt("land_x", updated.landscapeCutoutX)
+                putInt("land_y", updated.landscapeCutoutY)
+                putBoolean("has_custom_port", updated.hasCustomPortraitPos)
+                putBoolean("has_custom_land", updated.hasCustomLandscapePos)
+                putBoolean("hold_drag_enabled", updated.isHoldAndDragEnabled)
+                putLong("charging_duration_ms", updated.chargingDurationMs)
+                putString("circle_style", updated.circleAnimationStyle.name)
                 apply()
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
-    fun updateDraggedOffset(context: Context, deltaX: Int, deltaY: Int) {
-        updateDraggedOffsetInMemory(deltaX, deltaY)
-        commitCutoutConfigToDisk(context)
+    fun hasCustomPortraitPosition(): Boolean = _cutoutConfig.value.hasCustomPortraitPos
+
+    fun hasCustomLandscapePosition(): Boolean = _cutoutConfig.value.hasCustomLandscapePos
+
+    fun updatePinnedShortcutsList(apps: List<TargetAppInfo>) {
+        if (apps.isNotEmpty()) {
+            _pinnedShortcuts.value = apps
+        }
     }
 
-    fun resetOffsetsToHardwareCutout(context: Context, portX: Int, portY: Int, landX: Int, landY: Int) {
-        val updated = _cutoutConfig.value.copy(
-            offsetX = portX,
-            offsetY = portY,
-            landscapeCutoutX = landX,
-            landscapeCutoutY = landY
+    fun resetOffsetsToHardwareCutout(
+        context: Context,
+        defaultPortX: Int,
+        defaultPortY: Int,
+        defaultLandX: Int,
+        defaultLandY: Int
+    ) {
+        val reset = _cutoutConfig.value.copy(
+            offsetX = defaultPortX,
+            offsetY = defaultPortY,
+            landscapeCutoutX = defaultLandX,
+            landscapeCutoutY = defaultLandY,
+            hasCustomPortraitPos = false,
+            hasCustomLandscapePos = false
         )
-        saveCutoutConfigToPrefs(context, updated, isCustomPort = false, isCustomLand = false)
-    }
-
-    fun hasCustomPortraitPosition(): Boolean = hasUserCustomPortraitOffset
-    fun hasCustomLandscapePosition(): Boolean = hasUserCustomLandscapeOffset
-
-    fun setFullscreenImmersive(immersive: Boolean) {
-        _isFullscreenImmersive.value = immersive
+        saveCutoutConfigToPrefs(context, reset, isCustomPort = false, isCustomLand = false)
     }
 
     fun togglePinnedPackage(context: Context, packageName: String) {
@@ -197,147 +195,163 @@ object IslandStateEngine {
         try {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
-                .putStringSet("pinned_pkgs", current)
+                .putStringSet("pinned_packages", current)
                 .apply()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+        }
+        refreshPinnedAppShortcuts(context)
+    }
+
+    fun refreshPinnedAppShortcuts(context: Context) {
+        engineScope.launch(Dispatchers.IO) {
+            try {
+                val pm = context.packageManager
+                val selectedSet = _pinnedShortcutPackages.value
+                val apps = mutableListOf<TargetAppInfo>()
+
+                if (selectedSet.isNotEmpty()) {
+                    for (pkg in selectedSet) {
+                        val launchIntent = pm.getLaunchIntentForPackage(pkg)?.apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        } ?: continue
+                        val appInfo = pm.getApplicationInfo(pkg, 0)
+                        apps.add(
+                            TargetAppInfo(
+                                label = pm.getApplicationLabel(appInfo).toString(),
+                                packageName = pkg,
+                                icon = pm.getApplicationIcon(appInfo),
+                                launchIntent = launchIntent
+                            )
+                        )
+                    }
+                } else {
+                    val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+                        addCategory(Intent.CATEGORY_LAUNCHER)
+                    }
+                    val resolved = pm.queryIntentActivities(mainIntent, 0)
+                    for (info in resolved) {
+                        val pkg = info.activityInfo.packageName
+                        if (pkg == context.packageName) continue
+                        val launch = pm.getLaunchIntentForPackage(pkg)?.apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        } ?: continue
+                        apps.add(
+                            TargetAppInfo(
+                                label = info.loadLabel(pm).toString(),
+                                packageName = pkg,
+                                activityName = info.activityInfo.name,
+                                icon = info.loadIcon(pm),
+                                launchIntent = launch
+                            )
+                        )
+                        if (apps.size >= 6) break
+                    }
+                }
+                _pinnedShortcuts.value = apps
+            } catch (e: Exception) {
+            }
         }
     }
 
-    fun updatePinnedShortcutsList(apps: List<TargetAppInfo>) {
-        _pinnedShortcuts.value = apps
-    }
-
     fun submitPayload(payload: IslandPayload) {
-        engineScope.launch {
-            when (payload) {
-                is IslandPayload.SystemAlert,
-                is IslandPayload.OriginAiSuggestion -> {
-                    if (payload.isOngoing) {
-                        val existing = ongoingTasks[payload.id]
-                        if (existing != null && existing is IslandPayload.SystemAlert &&
-                            existing.title == (payload as? IslandPayload.SystemAlert)?.title
-                        ) {
-                            return@launch
-                        }
-                        isUserMinimized = false
-                        ongoingTasks[payload.id] = payload
-                        recalculateSlots()
-                    } else {
-                        val previousPrimary = _primarySlot.value
-                        _primarySlot.value = payload
-                        _displayMode.value = IslandDisplayMode.COMPACT_SINGLE
-
-                        autoDismissJob?.cancel()
-                        val timeout = payload.autoDismissMs ?: 2800L
-                        autoDismissJob = launch {
-                            delay(timeout)
-                            restoreOngoingState(previousPrimary)
-                        }
-                    }
-                }
-
-                is IslandPayload.CommunicationActivity -> {
+        when (payload) {
+            is IslandPayload.SystemAlert -> {
+                if (payload.isOngoing) {
+                    ongoingTasks[payload.id] = payload
                     isUserMinimized = false
-                    if (payload.isOngoingCall) {
-                        ongoingTasks[payload.id] = payload
-                        recalculateSlots()
-                    } else {
-                        val cooledPayload = applyNotificationCooldown(payload)
-                        _primarySlot.value = cooledPayload
-                        _displayMode.value = IslandDisplayMode.COMPACT_SINGLE
-                        autoDismissJob?.cancel()
-                        autoDismissJob = launch {
-                            delay(4000L)
-                            recalculateSlots()
-                        }
-                    }
+                    recomputeSlots()
+                } else {
+                    showTransientAlert(payload)
                 }
-
-                is IslandPayload.MediaActivity -> {
-                    if (lastTrackTitle != payload.trackTitle) {
-                        lastTrackTitle = payload.trackTitle
-                        isUserMinimized = false
-                    }
-                    ongoingTasks[payload.id] = payload
-                    recalculateSlots()
+            }
+            is IslandPayload.OriginAiSuggestion -> {
+                showTransientOriginSuggestion(payload)
+            }
+            is IslandPayload.MediaActivity -> {
+                val isNewTrack = lastKnownTrackTitle != payload.trackTitle
+                lastKnownTrackTitle = payload.trackTitle
+                ongoingTasks[payload.id] = payload
+                if (isNewTrack) {
+                    isUserMinimized = false
                 }
-
-                is IslandPayload.LiveProgressActivity -> {
-                    val isNewTask = !ongoingTasks.containsKey(payload.id)
-                    if (isNewTask) isUserMinimized = false
-                    ongoingTasks[payload.id] = payload
-                    recalculateSlots()
-                }
-
-                IslandPayload.Idle -> {
-                    recalculateSlots()
-                }
+                recomputeSlots()
+            }
+            is IslandPayload.Idle -> {
+                ongoingTasks.clear()
+                recomputeSlots()
+            }
+            else -> {
+                isUserMinimized = false
+                ongoingTasks[payload.id] = payload
+                recomputeSlots()
             }
         }
     }
 
     fun removePayload(id: String) {
-        val removed = ongoingTasks.remove(id) ?: return
-        if (id == "media_session") lastTrackTitle = null
-        if (ongoingTasks.isEmpty()) isUserMinimized = false
-        if (removed.id == id) {
-            recalculateSlots()
+        ongoingTasks.remove(id)
+        if (_primarySlot.value.id == id) {
+            transientAlertJob?.cancel()
+        }
+        recomputeSlots()
+    }
+
+    private fun showTransientAlert(alert: IslandPayload.SystemAlert) {
+        transientAlertJob?.cancel()
+        isUserMinimized = false
+        _primarySlot.value = alert
+        _displayMode.value = IslandDisplayMode.COMPACT_SINGLE
+
+        transientAlertJob = engineScope.launch {
+            delay(alert.autoDismissMs)
+            recomputeSlots()
         }
     }
 
-    private fun restoreOngoingState(fallback: IslandPayload) {
-        if (ongoingTasks.isNotEmpty()) {
-            recalculateSlots()
-        } else if (fallback !is IslandPayload.SystemAlert &&
-            fallback !is IslandPayload.OriginAiSuggestion &&
-            fallback !is IslandPayload.Idle
-        ) {
-            _primarySlot.value = fallback
-            _displayMode.value = IslandDisplayMode.COMPACT_SPLIT
-        } else {
-            _primarySlot.value = IslandPayload.Idle
-            _displayMode.value = IslandDisplayMode.IDLE
+    private fun showTransientOriginSuggestion(suggestion: IslandPayload.OriginAiSuggestion) {
+        transientAlertJob?.cancel()
+        isUserMinimized = false
+        _primarySlot.value = suggestion
+        _displayMode.value = IslandDisplayMode.COMPACT_SINGLE
+
+        transientAlertJob = engineScope.launch {
+            delay(7500L)
+            recomputeSlots()
         }
     }
 
-    private fun recalculateSlots() {
-        val sorted = ongoingTasks.values.sortedWith(
-            compareBy<IslandPayload> { it.priority.level }.thenByDescending { it.timestamp }
-        )
+    private fun recomputeSlots() {
+        val sorted = ongoingTasks.values.sortedByDescending { it.priority }
         when {
             sorted.isEmpty() -> {
+                isUserMinimized = false
                 _primarySlot.value = IslandPayload.Idle
                 _secondarySlot.value = null
-                if (_displayMode.value != IslandDisplayMode.QUICK_TOOLS &&
-                    _displayMode.value != IslandDisplayMode.ORIGIN_DRAG_WHEEL
+                if (_displayMode.value != IslandDisplayMode.ORIGIN_DRAG_WHEEL &&
+                    _displayMode.value != IslandDisplayMode.QUICK_TOOLS
                 ) {
                     _displayMode.value = IslandDisplayMode.IDLE
                 }
             }
+            isUserMinimized -> {
+                _primarySlot.value = sorted[0]
+                _secondarySlot.value = sorted.getOrNull(1)
+                _displayMode.value = IslandDisplayMode.IDLE
+            }
             sorted.size == 1 -> {
                 _primarySlot.value = sorted[0]
                 _secondarySlot.value = null
-                if (isUserMinimized) {
-                    _displayMode.value = IslandDisplayMode.IDLE
-                } else if (_displayMode.value != IslandDisplayMode.EXPANDED_CARD &&
-                    _displayMode.value != IslandDisplayMode.QUICK_TOOLS &&
-                    _displayMode.value != IslandDisplayMode.ORIGIN_DRAG_WHEEL
+                if (_displayMode.value != IslandDisplayMode.EXPANDED_CARD &&
+                    _displayMode.value != IslandDisplayMode.QUICK_TOOLS
                 ) {
-                    _displayMode.value = if (sorted[0] is IslandPayload.MediaActivity) {
-                        IslandDisplayMode.COMPACT_SPLIT
-                    } else {
-                        IslandDisplayMode.COMPACT_SINGLE
-                    }
+                    _displayMode.value = IslandDisplayMode.COMPACT_SPLIT
                 }
             }
             else -> {
                 _primarySlot.value = sorted[0]
                 _secondarySlot.value = sorted[1]
-                if (isUserMinimized) {
-                    _displayMode.value = IslandDisplayMode.IDLE
-                } else if (_displayMode.value != IslandDisplayMode.EXPANDED_CARD &&
-                    _displayMode.value != IslandDisplayMode.QUICK_TOOLS &&
-                    _displayMode.value != IslandDisplayMode.ORIGIN_DRAG_WHEEL
+                if (_displayMode.value != IslandDisplayMode.EXPANDED_CARD &&
+                    _displayMode.value != IslandDisplayMode.QUICK_TOOLS
                 ) {
                     _displayMode.value = IslandDisplayMode.COMPACT_SPLIT
                 }
@@ -349,43 +363,28 @@ object IslandStateEngine {
         val currentPrimary = _primarySlot.value
         val currentSecondary = _secondarySlot.value
         if (currentSecondary != null && currentPrimary !is IslandPayload.Idle) {
-            val now = System.currentTimeMillis()
-            val updatedSecondary = when (currentSecondary) {
-                is IslandPayload.MediaActivity -> currentSecondary.copy(timestamp = now + 10)
-                is IslandPayload.LiveProgressActivity -> currentSecondary.copy(timestamp = now + 10)
-                is IslandPayload.CommunicationActivity -> currentSecondary.copy(timestamp = now + 10)
-                is IslandPayload.SystemAlert -> currentSecondary.copy(timestamp = now + 10)
-                else -> currentSecondary
-            }
-            ongoingTasks[updatedSecondary.id] = updatedSecondary
-            recalculateSlots()
+            _primarySlot.value = currentSecondary
+            _secondarySlot.value = currentPrimary
         } else {
-            _displayMode.value = IslandDisplayMode.QUICK_TOOLS
+            openQuickTools()
         }
     }
 
-    private fun applyNotificationCooldown(incoming: IslandPayload.CommunicationActivity): IslandPayload.CommunicationActivity {
-        val now = System.currentTimeMillis()
-        val history = notificationBurstTracker.getOrPut(incoming.id) { mutableListOf() }
-        history.removeAll { now - it > 10_000L }
-        history.add(now)
-
-        return if (history.size >= 3) {
-            incoming.copy(
-                messageOrStatus = "(${history.size}) ${incoming.messageOrStatus}",
-                burstCount = history.size
-            )
+    fun expandIsland() {
+        if (_primarySlot.value !is IslandPayload.Idle) {
+            isUserMinimized = false
+            _displayMode.value = IslandDisplayMode.EXPANDED_CARD
         } else {
-            incoming
+            openQuickTools()
         }
     }
 
     fun onIdleCircleTapped() {
         if (ongoingTasks.isNotEmpty()) {
             isUserMinimized = false
-            recalculateSlots()
+            recomputeSlots()
         } else {
-            _displayMode.value = IslandDisplayMode.QUICK_TOOLS
+            openQuickTools()
         }
     }
 
@@ -393,43 +392,34 @@ object IslandStateEngine {
         _displayMode.value = IslandDisplayMode.QUICK_TOOLS
     }
 
-    fun expandIsland() {
-        isUserMinimized = false
-        if (_primarySlot.value !is IslandPayload.Idle) {
-            _displayMode.value = IslandDisplayMode.EXPANDED_CARD
-        } else {
-            _displayMode.value = IslandDisplayMode.QUICK_TOOLS
-        }
-    }
-
     fun collapseIsland() {
+        recomputeSlots()
         if (ongoingTasks.isEmpty()) {
             _displayMode.value = IslandDisplayMode.IDLE
+        } else if (!isUserMinimized) {
+            _displayMode.value = IslandDisplayMode.COMPACT_SPLIT
         } else {
-            recalculateSlots()
+            _displayMode.value = IslandDisplayMode.IDLE
         }
     }
 
     fun minimizeToIdle() {
+        transientAlertJob?.cancel()
         isUserMinimized = true
         _displayMode.value = IslandDisplayMode.IDLE
     }
 
     fun handleDismissSwipe() {
-        if (_cutoutConfig.value.isLandscape) {
-            minimizeToIdle()
-            return
-        }
         when (_displayMode.value) {
-            IslandDisplayMode.EXPANDED_CARD,
-            IslandDisplayMode.QUICK_TOOLS,
-            IslandDisplayMode.ORIGIN_DRAG_WHEEL -> {
-                if (ongoingTasks.isEmpty()) {
-                    minimizeToIdle()
+            IslandDisplayMode.EXPANDED_CARD -> {
+                _displayMode.value = if (ongoingTasks.isNotEmpty()) {
+                    IslandDisplayMode.COMPACT_SPLIT
                 } else {
-                    collapseIsland()
+                    IslandDisplayMode.IDLE
                 }
             }
+            IslandDisplayMode.QUICK_TOOLS,
+            IslandDisplayMode.ORIGIN_DRAG_WHEEL,
             IslandDisplayMode.COMPACT_SINGLE,
             IslandDisplayMode.COMPACT_SPLIT -> {
                 minimizeToIdle()
@@ -438,12 +428,12 @@ object IslandStateEngine {
         }
     }
 
-    fun setDragWheelActive(active: Boolean, apps: List<TargetAppInfo> = emptyList()) {
+    fun setDragWheelActive(active: Boolean, targetApps: List<TargetAppInfo> = emptyList()) {
         if (active) {
-            _dragTargetApps.value = apps
+            _dragTargetApps.value = targetApps
             _displayMode.value = IslandDisplayMode.ORIGIN_DRAG_WHEEL
         } else {
-            recalculateSlots()
+            collapseIsland()
         }
     }
 
@@ -456,8 +446,9 @@ object IslandStateEngine {
         }
     }
 
-    fun updatePrivacyState(camera: Boolean? = null, mic: Boolean? = null) =
+    fun updatePrivacyState(camera: Boolean? = null, mic: Boolean? = null) {
         updatePrivacyDots(camera, mic)
+    }
 
     fun updateQuickTileState(
         torch: Boolean? = null,
@@ -466,6 +457,7 @@ object IslandStateEngine {
         autoRotate: Boolean? = null,
         ringerMode: Int? = null,
         volumeFraction: Float? = null,
+        brightnessFraction: Float? = null,
         batteryPct: Int? = null
     ) {
         _quickTileStates.update {
@@ -476,6 +468,7 @@ object IslandStateEngine {
                 isAutoRotateOn = autoRotate ?: it.isAutoRotateOn,
                 ringerMode = ringerMode ?: it.ringerMode,
                 volumeFraction = volumeFraction ?: it.volumeFraction,
+                brightnessFraction = brightnessFraction ?: it.brightnessFraction,
                 batteryPct = batteryPct ?: it.batteryPct
             )
         }
@@ -485,17 +478,14 @@ object IslandStateEngine {
         torch: Boolean? = null,
         bluetooth: Boolean? = null,
         hotspot: Boolean? = null,
-        autoRotate: Boolean? = null,
-        ringerMode: Int? = null,
-        volumeFraction: Float? = null,
-        batteryPct: Int? = null
-    ) = updateQuickTileState(torch, bluetooth, hotspot, autoRotate, ringerMode, volumeFraction, batteryPct)
-
-    fun addToStash(item: StashItem) {
-        _stashItems.update { (listOf(item) + it).take(10) }
+        autoRotate: Boolean? = null
+    ) {
+        updateQuickTileState(torch = torch, bluetooth = bluetooth, hotspot = hotspot, autoRotate = autoRotate)
     }
 
-    fun addStashItem(item: StashItem) = addToStash(item)
+    fun updateCutoutConfig(config: CutoutConfig) {
+        _cutoutConfig.value = config
+    }
 
     fun recordClipboard(text: String) {
         if (text.isBlank()) return
@@ -504,18 +494,19 @@ object IslandStateEngine {
         }
     }
 
-    fun addClipboardEntry(text: String) = recordClipboard(text)
-
-    fun updateCutoutConfig(config: CutoutConfig) {
-        _cutoutConfig.value = config
+    fun addClipboardEntry(text: String) {
+        recordClipboard(text)
     }
 
-    fun updateBurnInOffset(offset: IntOffset) {
-        _burnInOffset.value = offset
+    fun addToStash(item: StashItem) {
+        _stashItems.update { (listOf(item) + it).take(10) }
+    }
+
+    fun addStashItem(item: StashItem) {
+        addToStash(item)
     }
 
     fun onScreenPowerStateChanged(isInteractive: Boolean) {
-        _isScreenInteractive.value = isInteractive
         if (!isInteractive) {
             burnInJob?.cancel()
         } else {
@@ -526,12 +517,12 @@ object IslandStateEngine {
     private fun startBurnInProtectionLoop() {
         burnInJob?.cancel()
         burnInJob = engineScope.launch {
-            var step = 0.0
+            var angle = 0.0
             while (isActive) {
-                delay(180_000L)
-                step += 0.8
-                val dx = (cos(step) * 2).toInt()
-                val dy = (sin(step) * 2).toInt()
+                delay(60_000L)
+                angle += 0.6
+                val dx = (cos(angle) * 2.0).toInt()
+                val dy = (sin(angle) * 2.0).toInt()
                 _burnInOffset.value = IntOffset(dx, dy)
             }
         }

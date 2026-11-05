@@ -217,7 +217,7 @@ class IslandAccessibilityService : AccessibilityService(),
                                 StashItem(
                                     id = System.currentTimeMillis().toString(),
                                     text = text,
-                                    uri = uri
+                                    imageUri = uri
                                 )
                             )
                             if (!text.isNullOrBlank()) {
