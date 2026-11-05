@@ -1,11 +1,13 @@
 package com.kgc.island2.service
 
 import android.app.Notification
+import android.app.RemoteInput
 import android.content.ComponentName
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
-import android.graphics.drawable.Drawable
+import android.graphics.drawable.Icon
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -13,190 +15,212 @@ import android.media.session.PlaybackState
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import androidx.compose.ui.graphics.Color
-import androidx.palette.graphics.Palette
 import com.kgc.island2.engine.IslandStateEngine
+import com.kgc.island2.model.IslandDisplayMode
 import com.kgc.island2.model.IslandPayload
 import kotlinx.coroutines.*
 
 class IslandNotificationService : NotificationListenerService() {
 
-    private val parserScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var mediaSessionManager: MediaSessionManager? = null
-    private var activeMediaController: MediaController? = null
+    private var activeControllers = listOf<MediaController>()
+    private var progressTickerJob: Job? = null
 
-    private val mediaCallback = object : MediaController.Callback() {
-        override fun onPlaybackStateChanged(state: PlaybackState?) {
-            activeMediaController?.let { publishMediaControllerState(it) }
-        }
-        override fun onMetadataChanged(metadata: MediaMetadata?) {
-            activeMediaController?.let { publishMediaControllerState(it) }
-        }
+    private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+        bindMediaControllers(controllers ?: emptyList())
     }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
-        setupMediaSessionTracking()
+        try {
+            mediaSessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+            val comp = ComponentName(this, IslandNotificationService::class.java)
+            val initial = mediaSessionManager?.getActiveSessions(comp).orEmpty()
+            bindMediaControllers(initial)
+            mediaSessionManager?.addOnActiveSessionsChangedListener(sessionListener, comp)
+        } catch (e: Exception) {
+        }
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
-        requestRebind(ComponentName(this, IslandNotificationService::class.java))
-    }
-
-    private fun setupMediaSessionTracking() {
-        mediaSessionManager = getSystemService(MEDIA_SESSION_SERVICE) as MediaSessionManager
-        val component = ComponentName(this, IslandNotificationService::class.java)
         try {
-            val controllers = mediaSessionManager?.getActiveSessions(component).orEmpty()
-            attachMediaControllers(controllers)
-            mediaSessionManager?.addOnActiveSessionsChangedListener({ list ->
-                attachMediaControllers(list.orEmpty())
-            }, component)
-        } catch (_: SecurityException) {
+            mediaSessionManager?.removeOnActiveSessionsChangedListener(sessionListener)
+            requestRebind(ComponentName(this, IslandNotificationService::class.java))
+        } catch (e: Exception) {
         }
     }
 
-    private fun attachMediaControllers(controllers: List<MediaController>) {
-        activeMediaController?.unregisterCallback(mediaCallback)
-        val active = controllers.firstOrNull()
-        activeMediaController = active
-        if (active == null) {
+    private fun bindMediaControllers(controllers: List<MediaController>) {
+        activeControllers = controllers
+        val primary = controllers.firstOrNull {
+            val state = it.playbackState?.state
+            state == PlaybackState.STATE_PLAYING ||
+                    state == PlaybackState.STATE_BUFFERING ||
+                    state == PlaybackState.STATE_PAUSED ||
+                    state == PlaybackState.STATE_SKIPPING_TO_NEXT ||
+                    state == PlaybackState.STATE_SKIPPING_TO_PREVIOUS
+        } ?: controllers.firstOrNull()
+
+        if (primary == null) {
+            progressTickerJob?.cancel()
             IslandStateEngine.removePayload("media_session")
             return
         }
-        active.registerCallback(mediaCallback)
-        publishMediaControllerState(active)
-    }
 
-    private fun publishMediaControllerState(controller: MediaController) {
-        parserScope.launch {
-            val meta = controller.metadata ?: return@launch
-            val state = controller.playbackState
-            val isPlaying = state?.state == PlaybackState.STATE_PLAYING
-
-            if (!isPlaying && state?.state != PlaybackState.STATE_PAUSED) {
-                IslandStateEngine.removePayload("media_session")
-                return@launch
+        publishMediaState(primary)
+        primary.registerCallback(object : MediaController.Callback() {
+            override fun onPlaybackStateChanged(state: PlaybackState?) {
+                if (state?.state == PlaybackState.STATE_STOPPED || state?.state == PlaybackState.STATE_NONE) {
+                    IslandStateEngine.removePayload("media_session")
+                } else {
+                    publishMediaState(primary)
+                }
             }
 
-            val title = meta.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
-            val artist = meta.getString(MediaMetadata.METADATA_KEY_ARTIST).orEmpty()
-            if (title.isBlank() && artist.isBlank()) return@launch
+            override fun onMetadataChanged(metadata: MediaMetadata?) {
+                publishMediaState(primary)
+            }
+        })
 
-            val rawArt = meta.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-                ?: meta.getBitmap(MediaMetadata.METADATA_KEY_ART)
-
-            val scaledArt = rawArt?.let { Bitmap.createScaledBitmap(it, 128, 128, true) }
-            val dominantColor = scaledArt?.let {
-                val palette = Palette.from(it).generate()
-                Color(palette.getVibrantColor(0xFF1DB954.toInt()))
-            } ?: Color(0xFF1DB954)
-
-            val duration = meta.getLong(MediaMetadata.METADATA_KEY_DURATION).coerceAtLeast(1L)
-            val pos = state?.position ?: 0L
-            val progress = (pos.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
-
-            IslandStateEngine.submitPayload(
-                IslandPayload.MediaActivity(
-                    trackTitle = title,
-                    artist = artist,
-                    albumArt = scaledArt,
-                    accentColor = dominantColor,
-                    isPlaying = isPlaying,
-                    progress = progress,
-                    packageName = controller.packageName,
-                    contentIntent = controller.sessionActivity,
-                    onPlayPause = {
-                        if (isPlaying) controller.transportControls.pause()
-                        else controller.transportControls.play()
-                    },
-                    onNext = { controller.transportControls.skipToNext() },
-                    onPrevious = { controller.transportControls.skipToPrevious() }
-                )
-            )
+        progressTickerJob?.cancel()
+        progressTickerJob = serviceScope.launch {
+            while (isActive) {
+                delay(1000L)
+                if (IslandStateEngine.displayMode.value == IslandDisplayMode.EXPANDED_CARD) {
+                    val state = primary.playbackState?.state
+                    if (state == PlaybackState.STATE_PLAYING) {
+                        publishMediaState(primary)
+                    }
+                }
+            }
         }
     }
 
+    private fun publishMediaState(controller: MediaController) {
+        val meta = controller.metadata ?: return
+        val state = controller.playbackState
+        val pbState = state?.state ?: PlaybackState.STATE_NONE
+
+        val title = meta.getString(MediaMetadata.METADATA_KEY_TITLE)
+            ?: meta.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)
+            ?: return
+        val artist = meta.getString(MediaMetadata.METADATA_KEY_ARTIST)
+            ?: meta.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
+            ?: ""
+        val duration = meta.getLong(MediaMetadata.METADATA_KEY_DURATION).coerceAtLeast(1L)
+        val rawArt = meta.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: meta.getBitmap(MediaMetadata.METADATA_KEY_ART)
+        val art = rawArt?.let { downscaleBitmap(it, 128) }
+
+        val basePos = state?.position ?: 0L
+        val lastUpdate = state?.lastPositionUpdateTime ?: 0L
+        val currentPos = if (pbState == PlaybackState.STATE_PLAYING && lastUpdate > 0L) {
+            val elapsed = android.os.SystemClock.elapsedRealtime() - lastUpdate
+            (basePos + (elapsed * (state?.playbackSpeed ?: 1f)).toLong()).coerceIn(0L, duration)
+        } else {
+            basePos.coerceIn(0L, duration)
+        }
+
+        val progressFraction = if (duration > 0L) {
+            (currentPos.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+        } else 0f
+
+        IslandStateEngine.submitPayload(
+            IslandPayload.MediaActivity(
+                id = "media_session",
+                packageName = controller.packageName,
+                trackTitle = title,
+                artist = artist,
+                albumArt = art,
+                isPlaying = pbState == PlaybackState.STATE_PLAYING || pbState == PlaybackState.STATE_BUFFERING,
+                progress = progressFraction,
+                durationMs = duration,
+                accentColor = extractDominantAccent(art),
+                contentIntent = controller.sessionActivity,
+                onPlayPause = {
+                    val current = controller.playbackState?.state
+                    if (current == PlaybackState.STATE_PLAYING) {
+                        controller.transportControls.pause()
+                    } else {
+                        controller.transportControls.play()
+                    }
+                },
+                onNext = { controller.transportControls.skipToNext() },
+                onPrevious = { controller.transportControls.skipToPrevious() },
+                onSeekTo = { posMs -> controller.transportControls.seekTo(posMs) }
+            )
+        )
+    }
+
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        if (sbn == null || sbn.packageName == packageName) return
-        parserScope.launch {
-            val notif = sbn.notification
-            val extras = notif.extras
-            val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
-            val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
-            val subText = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()?.trim().orEmpty()
-            if (title.isEmpty() && text.isEmpty()) return@launch
+        val notification = sbn?.notification ?: return
+        val pkg = sbn.packageName ?: return
+        if (pkg == packageName) return
 
-            val category = notif.category
-            val largeIconBitmap = notif.getLargeIcon()?.loadDrawable(this@IslandNotificationService)?.toBitmap(96)
+        if (notification.extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) {
+            return
+        }
 
-            // 1. Real Incoming & Ongoing Calls
-            if (category == Notification.CATEGORY_CALL) {
-                val actions = notif.actions.orEmpty()
-                val acceptIntent = actions.firstOrNull()?.actionIntent
-                val declineIntent = actions.lastOrNull()?.takeIf { actions.size > 1 }?.actionIntent
+        val extras = notification.extras
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
+        if (title.isEmpty() && text.isEmpty()) return
 
-                IslandStateEngine.submitPayload(
-                    IslandPayload.CommunicationActivity(
-                        id = sbn.key,
-                        senderName = title,
-                        messageOrStatus = text.ifEmpty { subText },
-                        isOngoingCall = true,
-                        avatar = largeIconBitmap,
-                        contentIntent = notif.contentIntent,
-                        acceptIntent = acceptIntent,
-                        declineIntent = declineIntent
-                    )
+        val category = notification.category
+        val isOngoing = (notification.flags and Notification.FLAG_ONGOING_EVENT) != 0
+        val progress = extras.getInt(Notification.EXTRA_PROGRESS, -1)
+        val progressMax = extras.getInt(Notification.EXTRA_PROGRESS_MAX, -1)
+        val hasProgress = progress >= 0 && progressMax > 0
+
+        if (category == Notification.CATEGORY_CALL || category == Notification.CATEGORY_MESSAGE || findReplyAction(notification) != null) {
+            val replyPair = findReplyAction(notification)
+            val largeIconBmp = loadLargeIconBitmap(notification.getLargeIcon())
+
+            val acceptIntent = notification.actions?.firstOrNull {
+                val lbl = it.title?.toString()?.lowercase().orEmpty()
+                lbl.contains("answer") || lbl.contains("accept")
+            }?.actionIntent
+
+            val declineIntent = notification.actions?.firstOrNull {
+                val lbl = it.title?.toString()?.lowercase().orEmpty()
+                lbl.contains("decline") || lbl.contains("reject") || lbl.contains("hang up") || lbl.contains("end")
+            }?.actionIntent
+
+            IslandStateEngine.submitPayload(
+                IslandPayload.CommunicationActivity(
+                    id = sbn.key,
+                    senderName = title.ifEmpty { pkg },
+                    messageOrStatus = text,
+                    avatar = largeIconBmp,
+                    isOngoingCall = category == Notification.CATEGORY_CALL && isOngoing,
+                    acceptIntent = acceptIntent,
+                    declineIntent = declineIntent,
+                    replyActionIntent = replyPair?.first,
+                    remoteInput = replyPair?.second,
+                    contentIntent = notification.contentIntent
                 )
-                return@launch
-            }
+            )
+            return
+        }
 
-            // 2. Real Progress Notifications (Navigation, Timers, Downloads, Delivery)
-            val progressMax = extras.getInt(Notification.EXTRA_PROGRESS_MAX, 0)
-            val progressCur = extras.getInt(Notification.EXTRA_PROGRESS, 0)
-            val isIndeterminate = extras.getBoolean(Notification.EXTRA_PROGRESS_INDETERMINATE, false)
+        if (hasProgress || (isOngoing && (category == Notification.CATEGORY_TRANSPORT || category == Notification.CATEGORY_NAVIGATION || category == Notification.CATEGORY_PROGRESS || category == Notification.CATEGORY_STOPWATCH || category == Notification.CATEGORY_ALARM))) {
+            val fraction = if (hasProgress) (progress.toFloat() / progressMax.toFloat()).coerceIn(0f, 1f) else 0.5f
+            val subText = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
+                ?: if (hasProgress) "${(fraction * 100).toInt()}%" else text
 
-            if (progressMax > 0 || category == Notification.CATEGORY_NAVIGATION || category == Notification.CATEGORY_PROGRESS) {
-                val fraction = if (progressMax > 0) {
-                    (progressCur.toFloat() / progressMax.toFloat()).coerceIn(0f, 1f)
-                } else {
-                    1f
-                }
-                val rightText = subText.ifEmpty {
-                    if (progressMax > 0) "${(fraction * 100).toInt()}%" else text
-                }
-
-                IslandStateEngine.submitPayload(
-                    IslandPayload.LiveProgressActivity(
-                        id = sbn.key,
-                        title = title.ifEmpty { text },
-                        etaOrTimerText = rightText,
-                        progressFraction = fraction,
-                        isIndeterminate = isIndeterminate,
-                        accentColor = Color(0xFF38BDF8),
-                        appIcon = largeIconBitmap,
-                        contentIntent = notif.contentIntent
-                    )
+            IslandStateEngine.submitPayload(
+                IslandPayload.LiveProgressActivity(
+                    id = sbn.key,
+                    title = title,
+                    etaOrTimerText = subText,
+                    progressFraction = fraction,
+                    appIcon = loadLargeIconBitmap(notification.getLargeIcon()),
+                    accentColor = Color(0xFF38BDF8),
+                    contentIntent = notification.contentIntent
                 )
-                return@launch
-            }
-
-            // 3. Real Messaging & Notifications with Inline Reply
-            val replyAction = notif.actions?.firstOrNull { !it.remoteInputs.isNullOrEmpty() }
-            if (category == Notification.CATEGORY_MESSAGE || replyAction != null || sbn.isClearable) {
-                IslandStateEngine.submitPayload(
-                    IslandPayload.CommunicationActivity(
-                        id = sbn.key,
-                        senderName = title,
-                        messageOrStatus = text,
-                        isOngoingCall = false,
-                        avatar = largeIconBitmap,
-                        contentIntent = notif.contentIntent,
-                        replyActionIntent = replyAction?.actionIntent,
-                        remoteInput = replyAction?.remoteInputs?.firstOrNull()
-                    )
-                )
-            }
+            )
         }
     }
 
@@ -205,14 +229,58 @@ class IslandNotificationService : NotificationListenerService() {
         IslandStateEngine.removePayload(key)
     }
 
-    private fun Drawable.toBitmap(maxSize: Int): Bitmap {
-        if (this is BitmapDrawable && bitmap != null) {
-            return Bitmap.createScaledBitmap(bitmap, maxSize, maxSize, true)
+    private fun findReplyAction(notification: Notification): Pair<android.app.PendingIntent, RemoteInput>? {
+        val actions = notification.actions ?: return null
+        for (action in actions) {
+            val remoteInputs = action.remoteInputs ?: continue
+            for (input in remoteInputs) {
+                if (input.allowFreeFormInput && action.actionIntent != null) {
+                    return Pair(action.actionIntent, input)
+                }
+            }
         }
-        val bmp = Bitmap.createBitmap(maxSize, maxSize, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        setBounds(0, 0, canvas.width, canvas.height)
-        draw(canvas)
-        return bmp
+        return null
+    }
+
+    private fun loadLargeIconBitmap(icon: Icon?): Bitmap? {
+        if (icon == null) return null
+        return try {
+            val drawable = icon.loadDrawable(this) ?: return null
+            if (drawable is BitmapDrawable && drawable.bitmap != null) {
+                downscaleBitmap(drawable.bitmap, 96)
+            } else {
+                val bmp = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(bmp)
+                drawable.setBounds(0, 0, 96, 96)
+                drawable.draw(canvas)
+                bmp
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun downscaleBitmap(src: Bitmap, maxDim: Int): Bitmap {
+        if (src.width <= maxDim && src.height <= maxDim) return src
+        return Bitmap.createScaledBitmap(src, maxDim, maxDim, true)
+    }
+
+    private fun extractDominantAccent(bmp: Bitmap?): Color {
+        if (bmp == null) return Color(0xFF38BDF8)
+        return try {
+            val pixel = bmp.getPixel(bmp.width / 2, bmp.height / 2)
+            val r = android.graphics.Color.red(pixel).coerceAtLeast(90)
+            val g = android.graphics.Color.green(pixel).coerceAtLeast(90)
+            val b = android.graphics.Color.blue(pixel).coerceAtLeast(90)
+            Color(r, g, b)
+        } catch (e: Exception) {
+            Color(0xFF38BDF8)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        progressTickerJob?.cancel()
+        serviceScope.cancel()
     }
 }

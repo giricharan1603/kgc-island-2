@@ -5,144 +5,146 @@ import android.app.RemoteInput
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.drawable.Drawable
+import android.media.AudioManager
 import android.net.Uri
-import androidx.compose.runtime.Immutable
 import androidx.compose.ui.graphics.Color
 
 enum class IslandDisplayMode {
-    IDLE,               // Circular ring around the camera punch-hole when not in use
-    COMPACT_SINGLE,     // Single active task or real hardware alert
-    COMPACT_SPLIT,      // Dual multitasking (Primary Pill + Secondary Circle)
-    EXPANDED_CARD,      // Long-press interactive widget
-    ORIGIN_DRAG_WHEEL,  // Real Drag & Go installed apps dock
-    QUICK_TOOLS         // Utility dock (Real Clipboard + Stash + Torch)
+    IDLE,
+    COMPACT_SINGLE,
+    COMPACT_SPLIT,
+    EXPANDED_CARD,
+    ORIGIN_DRAG_WHEEL,
+    QUICK_TOOLS
 }
 
-enum class TaskPriority(val level: Int) {
-    CRITICAL(1),
-    SYSTEM_ALERT(2),
-    ORIGIN_AI(2),
-    LIVE_ACTIVITY(3),
-    IDLE(4)
+enum class AlertIconType {
+    CHARGING,
+    LOW_BATTERY,
+    RINGER_SILENT,
+    RINGER_VIBRATE,
+    RINGER_NORMAL,
+    TORCH,
+    HOTSPOT,
+    BLUETOOTH,
+    NOTIFICATION
 }
 
-@Immutable
+enum class CircleAnimationStyle(val label: String) {
+    CYBER_SWEEP("Cyber Sweep (Neon Gradient)"),
+    PULSE_GLOW("Pulse Breathing Glow"),
+    ORBIT_DOTS("Dual Orbiting Satellites"),
+    BATTERY_RING("Live Battery Level Arc"),
+    STEALTH_STATIC("Stealth Minimal Ring")
+}
+
+data class CutoutConfig(
+    val baseWidthDp: Int = 34,
+    val baseHeightDp: Int = 34,
+    val idleCircleSizeDp: Int = 34,
+    val offsetX: Int = 0,
+    val offsetY: Int = 10,
+    val isLandscape: Boolean = false,
+    val landscapeRotation: Int = 0,
+    val landscapeCutoutX: Int = 14,
+    val landscapeCutoutY: Int = 0,
+    val hasCustomPortraitPos: Boolean = false,
+    val hasCustomLandscapePos: Boolean = false,
+    val isHoldAndDragEnabled: Boolean = true,
+    val chargingDurationMs: Long = 6500L,
+    val circleAnimationStyle: CircleAnimationStyle = CircleAnimationStyle.CYBER_SWEEP
+)
+
 data class PrivacyIndicatorState(
     val isCameraActive: Boolean = false,
     val isMicActive: Boolean = false
 )
 
-@Immutable
-data class CutoutConfig(
-    val offsetX: Int = 0,
-    val offsetY: Int = 10,
-    val idleCircleSizeDp: Int = 28 // Exact circle diameter around the camera punch-hole
+data class QuickTileStates(
+    val isTorchOn: Boolean = false,
+    val isBluetoothOn: Boolean = false,
+    val isHotspotOn: Boolean = false,
+    val isAutoRotateOn: Boolean = false,
+    val ringerMode: Int = AudioManager.RINGER_MODE_NORMAL,
+    val volumeFraction: Float = 0.5f,
+    val brightnessFraction: Float = 0.5f,
+    val batteryPct: Int = 100
 )
 
-@Immutable
 data class TargetAppInfo(
     val label: String,
     val packageName: String,
-    val activityName: String,
+    val activityName: String = "",
     val icon: Drawable,
     val launchIntent: Intent
 )
 
-@Immutable
 data class StashItem(
     val id: String,
     val text: String? = null,
-    val uri: Uri? = null,
-    val mimeType: String = "text/plain",
+    val imageUri: Uri? = null,
     val timestamp: Long = System.currentTimeMillis()
 )
 
-@Immutable
-sealed interface IslandPayload {
-    val id: String
-    val priority: TaskPriority
-    val timestamp: Long
+sealed class IslandPayload(open val id: String, open val priority: Int) {
 
-    data object Idle : IslandPayload {
-        override val id = "idle"
-        override val priority = TaskPriority.IDLE
-        override val timestamp = 0L
-    }
+    data object Idle : IslandPayload("idle", 0)
 
     data class SystemAlert(
         override val id: String,
         val title: String,
-        val subtitle: String,
-        val accentColor: Color,
-        val iconType: AlertIconType,
-        val autoDismissMs: Long = 2400L,
-        override val timestamp: Long = System.currentTimeMillis()
-    ) : IslandPayload {
-        override val priority = TaskPriority.SYSTEM_ALERT
-    }
+        val subtitle: String = "",
+        val accentColor: Color = Color(0xFF38BDF8),
+        val iconType: AlertIconType = AlertIconType.NOTIFICATION,
+        val autoDismissMs: Long = 3000L,
+        val isOngoing: Boolean = false
+    ) : IslandPayload(id, if (isOngoing) 75 else 95)
 
     data class MediaActivity(
         override val id: String = "media_session",
+        val packageName: String = "",
         val trackTitle: String,
         val artist: String,
         val albumArt: Bitmap? = null,
-        val accentColor: Color = Color(0xFF1DB954),
         val isPlaying: Boolean = true,
         val progress: Float = 0f,
-        val packageName: String = "",
+        val durationMs: Long = 0L,
+        val accentColor: Color = Color(0xFF38BDF8),
         val contentIntent: PendingIntent? = null,
         val onPlayPause: (() -> Unit)? = null,
         val onNext: (() -> Unit)? = null,
         val onPrevious: (() -> Unit)? = null,
-        override val timestamp: Long = System.currentTimeMillis()
-    ) : IslandPayload {
-        override val priority = TaskPriority.LIVE_ACTIVITY
-    }
-
-    data class CommunicationActivity(
-        override val id: String,
-        val senderName: String,
-        val messageOrStatus: String,
-        val isOngoingCall: Boolean,
-        val avatar: Bitmap? = null,
-        val contentIntent: PendingIntent? = null,
-        val acceptIntent: PendingIntent? = null,
-        val declineIntent: PendingIntent? = null,
-        val replyActionIntent: PendingIntent? = null,
-        val remoteInput: RemoteInput? = null,
-        val burstCount: Int = 1,
-        override val timestamp: Long = System.currentTimeMillis()
-    ) : IslandPayload {
-        override val priority = if (isOngoingCall) TaskPriority.CRITICAL else TaskPriority.SYSTEM_ALERT
-    }
+        val onSeekTo: ((Long) -> Unit)? = null
+    ) : IslandPayload(id, 65)
 
     data class LiveProgressActivity(
         override val id: String,
         val title: String,
         val etaOrTimerText: String,
-        val progressFraction: Float,
-        val isIndeterminate: Boolean = false,
-        val accentColor: Color = Color(0xFF38BDF8),
+        val progressFraction: Float = 0.5f,
         val appIcon: Bitmap? = null,
-        val contentIntent: PendingIntent? = null,
-        override val timestamp: Long = System.currentTimeMillis()
-    ) : IslandPayload {
-        override val priority = TaskPriority.LIVE_ACTIVITY
-    }
+        val accentColor: Color = Color(0xFF38BDF8),
+        val contentIntent: PendingIntent? = null
+    ) : IslandPayload(id, 80)
+
+    data class CommunicationActivity(
+        override val id: String,
+        val senderName: String,
+        val messageOrStatus: String,
+        val avatar: Bitmap? = null,
+        val isOngoingCall: Boolean = false,
+        val acceptIntent: PendingIntent? = null,
+        val declineIntent: PendingIntent? = null,
+        val replyActionIntent: PendingIntent? = null,
+        val remoteInput: RemoteInput? = null,
+        val contentIntent: PendingIntent? = null
+    ) : IslandPayload(id, 100)
 
     data class OriginAiSuggestion(
         override val id: String = "origin_ai",
-        val actionTitle: String,
         val extractedText: String,
+        val actionTitle: String,
         val targetApps: List<TargetAppInfo> = emptyList(),
-        val primaryIntent: Intent? = null,
-        override val timestamp: Long = System.currentTimeMillis()
-    ) : IslandPayload {
-        override val priority = TaskPriority.ORIGIN_AI
-    }
-}
-
-enum class AlertIconType {
-    CHARGING, LOW_BATTERY, RINGER_SILENT, RINGER_VIBRATE, RINGER_NORMAL,
-    BLUETOOTH, TORCH, BIOMETRIC
+        val primaryIntent: Intent? = null
+    ) : IslandPayload(id, 90)
 }
