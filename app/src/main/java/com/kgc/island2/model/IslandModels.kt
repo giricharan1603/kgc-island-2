@@ -19,6 +19,14 @@ enum class IslandDisplayMode {
     QUICK_TOOLS
 }
 
+enum class CircleAnimationStyle(val label: String) {
+    CYBER_SWEEP("Cyber Neon Sweep"),
+    PULSE_GLOW("Breathing Pulse Aura"),
+    ORBIT_DOTS("Dual-Orbit Plasma Dots"),
+    BATTERY_RING("Live Battery Arc"),
+    STEALTH_STATIC("Minimal Stealth Ring")
+}
+
 enum class TaskPriority(val level: Int, val weight: Int) {
     CRITICAL(1, 100),
     SYSTEM_ALERT(2, 85),
@@ -54,7 +62,8 @@ data class QuickTileStates(
     val isAutoRotateOn: Boolean = false,
     val ringerMode: Int = AudioManager.RINGER_MODE_NORMAL,
     val volumeFraction: Float = 0.5f,
-    val brightnessFraction: Float = 0.5f
+    val brightnessFraction: Float = 0.5f,
+    val batteryPct: Int = 100
 )
 
 @Immutable
@@ -67,7 +76,10 @@ data class CutoutConfig(
     val isLandscape: Boolean = false,
     val landscapeRotation: Int = 0,
     val landscapeCutoutX: Int = 14,
-    val landscapeCutoutY: Int = 0
+    val landscapeCutoutY: Int = 0,
+    val isHoldAndDragEnabled: Boolean = true,
+    val chargingDurationMs: Long = 6500L,
+    val circleAnimationStyle: CircleAnimationStyle = CircleAnimationStyle.CYBER_SWEEP
 )
 
 @Immutable
@@ -111,7 +123,7 @@ sealed interface IslandPayload {
         val accentColor: Color = Color(0xFF22C55E),
         val iconType: AlertIconType = AlertIconType.NOTIFICATION,
         override val isOngoing: Boolean = false,
-        override val autoDismissMs: Long? = 2600L,
+        override val autoDismissMs: Long? = 2800L,
         override val timestamp: Long = System.currentTimeMillis()
     ) : IslandPayload {
         override val priority = if (isOngoing) TaskPriority.LIVE_ACTIVITY else TaskPriority.SYSTEM_ALERT

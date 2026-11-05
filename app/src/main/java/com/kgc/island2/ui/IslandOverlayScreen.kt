@@ -3,6 +3,7 @@ package com.kgc.island2.ui
 import android.app.RemoteInput
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
@@ -10,10 +11,11 @@ import android.graphics.drawable.Drawable
 import android.media.AudioManager
 import android.os.Bundle
 import android.view.HapticFeedbackConstants
-import androidx.compose.animation.animateColor
+import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
@@ -35,33 +37,41 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.kgc.island2.engine.IslandStateEngine
 import com.kgc.island2.model.*
 import kotlinx.coroutines.delay
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.sin
 
 @Composable
 fun IslandOverlayScreen(
     onStatusBarSwipeDown: () -> Unit,
     onToggleTorch: () -> Unit,
-    onToggleBluetooth: () -> Unit,
-    onToggleHotspot: () -> Unit,
-    onToggleAutoRotate: () -> Unit,
+    onToggleBluetooth: () -> Unit = {},
+    onToggleAutoRotate: () -> Unit = {},
     onToggleRingerMode: () -> Unit = {},
+    onTakeScreenshot: () -> Unit = {},
+    onLockScreen: () -> Unit = {},
     onSetVolumeFraction: (Float) -> Unit = {},
-    onSetBrightnessFraction: (Float) -> Unit = {},
     onAdjustVolume: (Float) -> Unit,
+    onDragReposition: (Float, Float) -> Unit = { _, _ -> },
+    onDragRepositionEnd: () -> Unit = {},
     onRequestKeyboardFocus: (Boolean) -> Unit,
     onPasteTextToFocusedApp: (String) -> Unit
 ) {
@@ -78,6 +88,37 @@ fun IslandOverlayScreen(
     val stashItems by IslandStateEngine.stashItems.collectAsState()
     val dragTargetApps by IslandStateEngine.dragTargetApps.collectAsState()
 
+    val prefs = remember { context.getSharedPreferences("kgc_island2_prefs", Context.MODE_PRIVATE) }
+    var idleCustomText by remember { mutableStateOf(prefs.getString("idle_custom_text", "").orEmpty()) }
+    var isIdleTextEnabled by remember { mutableStateOf(prefs.getBoolean("idle_text_enabled", false)) }
+    var idleThemeStyle by remember { mutableStateOf(prefs.getString("idle_theme_style", "CYBER_SWEEP").orEmpty()) }
+    var idleColorPalette by remember { mutableStateOf(prefs.getString("idle_color_palette", "CYBER_CYAN").orEmpty()) }
+    var isLyricsEnabled by remember { mutableStateOf(prefs.getBoolean("lyrics_enabled", true)) }
+    var currentLyricLine by remember { mutableStateOf(prefs.getString("current_lyric_line", "").orEmpty()) }
+    var edgeFlashColorHex by remember { mutableLongStateOf(prefs.getLong("edge_flash_color", 0xFF38BDF8L)) }
+    var edgeFlashTimestamp by remember { mutableLongStateOf(prefs.getLong("edge_flash_timestamp", 0L)) }
+
+    DisposableEffect(prefs) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { sp, key ->
+            when (key) {
+                "idle_custom_text" -> idleCustomText = sp.getString("idle_custom_text", "").orEmpty()
+                "idle_text_enabled" -> isIdleTextEnabled = sp.getBoolean("idle_text_enabled", false)
+                "idle_theme_style" -> idleThemeStyle = sp.getString("idle_theme_style", "CYBER_SWEEP").orEmpty()
+                "idle_color_palette" -> idleColorPalette = sp.getString("idle_color_palette", "CYBER_CYAN").orEmpty()
+                "lyrics_enabled" -> isLyricsEnabled = sp.getBoolean("lyrics_enabled", true)
+                "current_lyric_line" -> currentLyricLine = sp.getString("current_lyric_line", "").orEmpty()
+                "edge_flash_color", "edge_flash_timestamp" -> {
+                    edgeFlashColorHex = sp.getLong("edge_flash_color", 0xFF38BDF8L)
+                    edgeFlashTimestamp = sp.getLong("edge_flash_timestamp", 0L)
+                }
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
+    val showIdleTextPill = displayMode == IslandDisplayMode.IDLE && isIdleTextEnabled && idleCustomText.isNotBlank()
+
     val transition = updateTransition(targetState = displayMode, label = "island_morph")
 
     val totalWidth by transition.animateDp(
@@ -86,14 +127,16 @@ fun IslandOverlayScreen(
     ) { mode ->
         when (mode) {
             IslandDisplayMode.IDLE -> {
-                if (privacyState.isCameraActive || privacyState.isMicActive) {
+                if (showIdleTextPill) {
+                    (cutoutConfig.idleCircleSizeDp + 124).dp
+                } else if (privacyState.isCameraActive || privacyState.isMicActive) {
                     (cutoutConfig.idleCircleSizeDp + 18).dp
                 } else {
                     cutoutConfig.idleCircleSizeDp.dp
                 }
             }
-            IslandDisplayMode.COMPACT_SINGLE -> 212.dp
-            IslandDisplayMode.COMPACT_SPLIT -> 264.dp
+            IslandDisplayMode.COMPACT_SINGLE -> 220.dp
+            IslandDisplayMode.COMPACT_SPLIT -> 270.dp
             IslandDisplayMode.EXPANDED_CARD,
             IslandDisplayMode.ORIGIN_DRAG_WHEEL,
             IslandDisplayMode.QUICK_TOOLS -> 356.dp
@@ -107,10 +150,10 @@ fun IslandOverlayScreen(
         when (mode) {
             IslandDisplayMode.IDLE -> cutoutConfig.idleCircleSizeDp.dp
             IslandDisplayMode.COMPACT_SINGLE,
-            IslandDisplayMode.COMPACT_SPLIT -> 36.dp
+            IslandDisplayMode.COMPACT_SPLIT -> 38.dp
             IslandDisplayMode.EXPANDED_CARD,
             IslandDisplayMode.ORIGIN_DRAG_WHEEL,
-            IslandDisplayMode.QUICK_TOOLS -> 218.dp
+            IslandDisplayMode.QUICK_TOOLS -> 230.dp
         }
     }
 
@@ -126,29 +169,16 @@ fun IslandOverlayScreen(
         }
     }
 
-    // Feature 1: Transparent fill in IDLE mode so ONLY the circumference ring wraps around the camera hole!
     val containerBgColor by transition.animateColor(
         transitionSpec = { tween(220) },
         label = "bg_color"
     ) { mode ->
-        if (mode == IslandDisplayMode.IDLE) Color.Transparent else Color.Black
-    }
-
-    val idleRingBrush = remember(primaryPayload, quickTileStates.isHotspotOn, privacyState) {
-        when {
-            privacyState.isCameraActive || privacyState.isMicActive -> {
-                Brush.linearGradient(listOf(Color(0xFF22C55E), Color(0xFFF97316)))
-            }
-            quickTileStates.isHotspotOn -> {
-                Brush.linearGradient(listOf(Color(0xFF22C55E), Color(0xFF4ADE80)))
-            }
-            primaryPayload is IslandPayload.MediaActivity -> {
-                val accent = (primaryPayload as IslandPayload.MediaActivity).accentColor
-                Brush.linearGradient(listOf(accent, Color(0xFF38BDF8)))
-            }
-            else -> {
-                Brush.linearGradient(listOf(Color(0xFF38BDF8), Color(0xFFA855F7)))
-            }
+        if (mode == IslandDisplayMode.IDLE && !showIdleTextPill) {
+            Color.Transparent
+        } else if (mode == IslandDisplayMode.IDLE && showIdleTextPill) {
+            Color.Black.copy(alpha = 0.82f)
+        } else {
+            Color.Black
         }
     }
 
@@ -162,22 +192,31 @@ fun IslandOverlayScreen(
                     view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                     when (displayMode) {
                         IslandDisplayMode.IDLE -> IslandStateEngine.onIdleCircleTapped()
-                        // Feature 2: Clicking compact pill expands the island to show song controls instead of opening Spotify!
                         IslandDisplayMode.COMPACT_SINGLE,
                         IslandDisplayMode.COMPACT_SPLIT -> IslandStateEngine.expandIsland()
                         else -> {}
                     }
                 },
-                onLongPress = {
+                onDoubleTap = {
                     view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                    if (displayMode == IslandDisplayMode.EXPANDED_CARD ||
-                        displayMode == IslandDisplayMode.QUICK_TOOLS
-                    ) {
-                        onRequestKeyboardFocus(false)
-                        IslandStateEngine.collapseIsland()
-                    } else {
-                        IslandStateEngine.expandIsland()
-                    }
+                    IslandStateEngine.openQuickTools()
+                }
+            )
+        }
+        .pointerInput(cutoutConfig.isLandscape) {
+            detectDragGesturesAfterLongPress(
+                onDragStart = {
+                    view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                },
+                onDragEnd = {
+                    onDragRepositionEnd()
+                },
+                onDragCancel = {
+                    onDragRepositionEnd()
+                },
+                onDrag = { change, dragAmount ->
+                    change.consume()
+                    onDragReposition(dragAmount.x, dragAmount.y)
                 }
             )
         }
@@ -224,7 +263,6 @@ fun IslandOverlayScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            // Left Primary Pill: Tapping expands to big control card (never auto-opens Spotify app)
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -242,16 +280,17 @@ fun IslandOverlayScreen(
                 CompactSingleView(
                     payload = primaryPayload,
                     privacyState = privacyState,
+                    isLyricsEnabled = isLyricsEnabled,
+                    currentLyricLine = currentLyricLine,
                     onToggleTorch = onToggleTorch
                 )
             }
 
             Spacer(modifier = Modifier.width(8.dp))
 
-            // Right Detached Circle: Swaps Hotspot/2nd task or opens Quick Tools
             Box(
                 modifier = Modifier
-                    .size(36.dp)
+                    .size(38.dp)
                     .clip(CircleShape)
                     .background(Color.Black)
                     .border(1.dp, Color(0xFF334155), CircleShape)
@@ -271,14 +310,12 @@ fun IslandOverlayScreen(
                 .offset { burnInOffset }
                 .clip(RoundedCornerShape(cornerRadius))
                 .background(containerBgColor)
-                .border(
-                    width = if (displayMode == IslandDisplayMode.IDLE) 2.2.dp else 1.dp,
-                    brush = if (displayMode == IslandDisplayMode.IDLE) {
-                        idleRingBrush
+                .then(
+                    if (displayMode != IslandDisplayMode.IDLE) {
+                        Modifier.border(1.dp, Color(0xFF1E293B), RoundedCornerShape(cornerRadius))
                     } else {
-                        SolidColor(Color(0xFF1E293B))
-                    },
-                    shape = RoundedCornerShape(cornerRadius)
+                        Modifier
+                    }
                 )
                 .then(gestureModifier)
                 .padding(
@@ -289,14 +326,23 @@ fun IslandOverlayScreen(
         ) {
             when (displayMode) {
                 IslandDisplayMode.IDLE -> {
-                    // Feature 1: Hollow Circumference Ring Only
-                    IdleHollowCircumferenceRing(privacyState = privacyState)
+                    IdleThemedRingAndRollDownTicker(
+                        themeStyle = idleThemeStyle,
+                        colorPalette = idleColorPalette,
+                        idleCustomText = if (showIdleTextPill) idleCustomText else "",
+                        privacyState = privacyState,
+                        primaryPayload = primaryPayload,
+                        edgeFlashColor = Color(edgeFlashColorHex.toInt()),
+                        edgeFlashTimestamp = edgeFlashTimestamp
+                    )
                 }
 
                 IslandDisplayMode.COMPACT_SINGLE -> {
                     CompactSingleView(
                         payload = primaryPayload,
                         privacyState = privacyState,
+                        isLyricsEnabled = isLyricsEnabled,
+                        currentLyricLine = currentLyricLine,
                         onToggleTorch = onToggleTorch
                     )
                 }
@@ -304,6 +350,8 @@ fun IslandOverlayScreen(
                 IslandDisplayMode.EXPANDED_CARD -> {
                     ExpandedIslandCard(
                         payload = primaryPayload,
+                        isLyricsEnabled = isLyricsEnabled,
+                        currentLyricLine = currentLyricLine,
                         onCollapse = {
                             onRequestKeyboardFocus(false)
                             IslandStateEngine.collapseIsland()
@@ -323,7 +371,9 @@ fun IslandOverlayScreen(
                     OriginDragAppsDock(
                         targetApps = dragTargetApps,
                         onAppClick = { app ->
-                            context.startActivity(app.launchIntent)
+                            try {
+                                context.startActivity(app.launchIntent)
+                            } catch (e: Exception) {}
                             IslandStateEngine.setDragWheelActive(false)
                         }
                     )
@@ -336,11 +386,11 @@ fun IslandOverlayScreen(
                         stashItems = stashItems,
                         onToggleTorch = onToggleTorch,
                         onToggleBluetooth = onToggleBluetooth,
-                        onToggleHotspot = onToggleHotspot,
                         onToggleAutoRotate = onToggleAutoRotate,
                         onToggleRingerMode = onToggleRingerMode,
+                        onTakeScreenshot = onTakeScreenshot,
+                        onLockScreen = onLockScreen,
                         onSetVolumeFraction = onSetVolumeFraction,
-                        onSetBrightnessFraction = onSetBrightnessFraction,
                         onPasteText = { text ->
                             onPasteTextToFocusedApp(text)
                             IslandStateEngine.collapseIsland()
@@ -355,14 +405,219 @@ fun IslandOverlayScreen(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun IdleHollowCircumferenceRing(privacyState: PrivacyIndicatorState) {
+private fun IdleThemedRingAndRollDownTicker(
+    themeStyle: String,
+    colorPalette: String,
+    idleCustomText: String,
+    privacyState: PrivacyIndicatorState,
+    primaryPayload: IslandPayload,
+    edgeFlashColor: Color,
+    edgeFlashTimestamp: Long
+) {
+    val (palettePrimary, paletteSecondary) = remember(colorPalette, primaryPayload) {
+        if (primaryPayload is IslandPayload.MediaActivity) {
+            Pair(primaryPayload.accentColor, Color(0xFF38BDF8))
+        } else {
+            when (colorPalette) {
+                "SUNSET_GOLD" -> Pair(Color(0xFFF59E0B), Color(0xFFEF4444))
+                "MATRIX_EMERALD" -> Pair(Color(0xFF10B981), Color(0xFF4ADE80))
+                "CRIMSON_BLAZE" -> Pair(Color(0xFFEF4444), Color(0xFFF97316))
+                "ROYAL_AMETHYST" -> Pair(Color(0xFFA855F7), Color(0xFFEC4899))
+                "MONO_SILVER" -> Pair(Color(0xFFE2E8F0), Color(0xFF64748B))
+                else -> Pair(Color(0xFF38BDF8), Color(0xFFA855F7))
+            }
+        }
+    }
+
+    var angle by remember { mutableFloatStateOf(0f) }
+    var pulseStroke by remember { mutableFloatStateOf(2.2f) }
+    var isEdgeFlashActive by remember { mutableStateOf(false) }
+
+    LaunchedEffect(edgeFlashTimestamp) {
+        if (System.currentTimeMillis() - edgeFlashTimestamp < 2600L) {
+            isEdgeFlashActive = true
+            delay(2500L)
+            isEdgeFlashActive = false
+        }
+    }
+
+    LaunchedEffect(themeStyle, isEdgeFlashActive) {
+        if (themeStyle == "STEALTH_STATIC" && !isEdgeFlashActive) return@LaunchedEffect
+        var t = 0f
+        while (true) {
+            delay(45L)
+            angle = (angle + 6f) % 360f
+            t += 0.2f
+            pulseStroke = 1.8f + ((sin(t) + 1f) * 0.85f)
+        }
+    }
+
+    val activePrimary = if (isEdgeFlashActive) edgeFlashColor else palettePrimary
+    val activeSecondary = if (isEdgeFlashActive) Color.White else paletteSecondary
+
+    val rollPhrases = remember(idleCustomText) {
+        if (idleCustomText.contains("|")) {
+            idleCustomText.split("|").map { it.trim() }.filter { it.isNotEmpty() }
+        } else if (idleCustomText.isNotBlank()) {
+            listOf(idleCustomText, "⚡ $idleCustomText")
+        } else {
+            emptyList()
+        }
+    }
+    var phraseIndex by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(rollPhrases) {
+        if (rollPhrases.size > 1) {
+            while (true) {
+                delay(2800L)
+                phraseIndex = (phraseIndex + 1) % rollPhrases.size
+            }
+        }
+    }
+
     Box(
         modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.CenterEnd
+        contentAlignment = Alignment.Center
     ) {
-        if (privacyState.isCameraActive || privacyState.isMicActive) {
-            PrivacyDotsRow(privacyState)
+        Canvas(modifier = Modifier.fillMaxSize().padding(1.5.dp)) {
+            val strokePx = if (isEdgeFlashActive) 3.2.dp.toPx() else pulseStroke.dp.toPx()
+            val cornerRad = size.minDimension / 2f
+
+            when (themeStyle) {
+                "RGB_CHROMA" -> {
+                    rotate(angle) {
+                        drawRoundRect(
+                            brush = Brush.sweepGradient(
+                                listOf(
+                                    Color(0xFFEF4444),
+                                    Color(0xFFF59E0B),
+                                    Color(0xFF22C55E),
+                                    Color(0xFF38BDF8),
+                                    Color(0xFFA855F7),
+                                    Color(0xFFEF4444)
+                                )
+                            ),
+                            cornerRadius = CornerRadius(cornerRad, cornerRad),
+                            style = Stroke(width = 2.4.dp.toPx())
+                        )
+                    }
+                }
+
+                "DUAL_SCANNER" -> {
+                    drawRoundRect(
+                        color = Color(0xFF1E293B),
+                        cornerRadius = CornerRadius(cornerRad, cornerRad),
+                        style = Stroke(width = 1.4.dp.toPx())
+                    )
+                    if (size.width <= size.height * 1.3f) {
+                        val r = (size.minDimension / 2f) - 2.dp.toPx()
+                        drawArc(
+                            color = activePrimary,
+                            startAngle = angle,
+                            sweepAngle = 75f,
+                            useCenter = false,
+                            style = Stroke(width = 2.6.dp.toPx(), cap = StrokeCap.Round)
+                        )
+                        drawArc(
+                            color = activeSecondary,
+                            startAngle = (angle + 180f) % 360f,
+                            sweepAngle = 75f,
+                            useCenter = false,
+                            style = Stroke(width = 2.6.dp.toPx(), cap = StrokeCap.Round)
+                        )
+                    } else {
+                        drawRoundRect(
+                            brush = Brush.linearGradient(listOf(activePrimary, activeSecondary)),
+                            cornerRadius = CornerRadius(cornerRad, cornerRad),
+                            style = Stroke(width = 2.2.dp.toPx())
+                        )
+                    }
+                }
+
+                "STARLIGHT" -> {
+                    drawRoundRect(
+                        color = Color(0xFF1E293B),
+                        cornerRadius = CornerRadius(cornerRad, cornerRad),
+                        style = Stroke(width = 1.5.dp.toPx())
+                    )
+                    val r = (size.minDimension / 2f) - 2.dp.toPx()
+                    for (i in 0 until 4) {
+                        val rad = ((angle + i * 90f) * PI / 180.0).toFloat()
+                        drawCircle(
+                            color = if (i % 2 == 0) activePrimary else activeSecondary,
+                            radius = 2.6.dp.toPx(),
+                            center = Offset(
+                                center.x + (r * cos(rad)),
+                                center.y + (r * sin(rad))
+                            )
+                        )
+                    }
+                }
+
+                "PULSE_GLOW" -> {
+                    drawRoundRect(
+                        brush = Brush.linearGradient(listOf(activePrimary, activeSecondary)),
+                        cornerRadius = CornerRadius(cornerRad, cornerRad),
+                        style = Stroke(width = strokePx)
+                    )
+                }
+
+                "STEALTH_STATIC" -> {
+                    drawRoundRect(
+                        brush = Brush.linearGradient(listOf(activePrimary.copy(alpha = 0.85f), activeSecondary.copy(alpha = 0.85f))),
+                        cornerRadius = CornerRadius(cornerRad, cornerRad),
+                        style = Stroke(width = if (isEdgeFlashActive) 3.dp.toPx() else 1.8.dp.toPx())
+                    )
+                }
+
+                else -> {
+                    rotate(angle) {
+                        drawRoundRect(
+                            brush = Brush.sweepGradient(
+                                listOf(activePrimary, activeSecondary, Color(0xFF0EA5E9), activePrimary)
+                            ),
+                            cornerRadius = CornerRadius(cornerRad, cornerRad),
+                            style = Stroke(width = if (isEdgeFlashActive) 3.2.dp.toPx() else 2.3.dp.toPx())
+                        )
+                    }
+                }
+            }
+        }
+
+        if (rollPhrases.isNotEmpty()) {
+            val currentPhrase = rollPhrases[phraseIndex.coerceIn(0, rollPhrases.lastIndex)]
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(start = 34.dp, end = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                AnimatedContent(
+                    targetState = currentPhrase,
+                    transitionSpec = {
+                        (slideInVertically { height -> -height } + fadeIn())
+                            .togetherWith(slideOutVertically { height -> height } + fadeOut())
+                    },
+                    label = "idle_roll_down"
+                ) { targetText ->
+                    Text(
+                        text = targetText,
+                        color = activePrimary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .basicMarquee()
+                    )
+                }
+            }
+        } else if (privacyState.isCameraActive || privacyState.isMicActive) {
+            Box(modifier = Modifier.fillMaxSize().padding(end = 4.dp), contentAlignment = Alignment.CenterEnd) {
+                PrivacyDotsRow(privacyState)
+            }
         }
     }
 }
@@ -372,11 +627,7 @@ private fun SideCircleContent(secondaryPayload: IslandPayload?) {
     when (secondaryPayload) {
         is IslandPayload.SystemAlert -> {
             Icon(
-                imageVector = if (secondaryPayload.iconType == AlertIconType.HOTSPOT) {
-                    Icons.Default.WifiTethering
-                } else {
-                    Icons.Default.Notifications
-                },
+                imageVector = Icons.Default.Notifications,
                 contentDescription = null,
                 tint = secondaryPayload.accentColor,
                 modifier = Modifier.size(18.dp)
@@ -384,8 +635,9 @@ private fun SideCircleContent(secondaryPayload: IslandPayload?) {
         }
         is IslandPayload.LiveProgressActivity -> {
             if (secondaryPayload.appIcon != null) {
+                val img = remember(secondaryPayload.id) { secondaryPayload.appIcon.asImageBitmap() }
                 Image(
-                    bitmap = secondaryPayload.appIcon.asImageBitmap(),
+                    bitmap = img,
                     contentDescription = null,
                     modifier = Modifier.size(20.dp).clip(CircleShape)
                 )
@@ -400,8 +652,9 @@ private fun SideCircleContent(secondaryPayload: IslandPayload?) {
         }
         is IslandPayload.MediaActivity -> {
             if (secondaryPayload.albumArt != null) {
+                val img = remember(secondaryPayload.trackTitle) { secondaryPayload.albumArt.asImageBitmap() }
                 Image(
-                    bitmap = secondaryPayload.albumArt.asImageBitmap(),
+                    bitmap = img,
                     contentDescription = null,
                     modifier = Modifier.size(22.dp).clip(CircleShape)
                 )
@@ -462,6 +715,8 @@ private fun PrivacyDotsRow(privacyState: PrivacyIndicatorState) {
 private fun CompactSingleView(
     payload: IslandPayload,
     privacyState: PrivacyIndicatorState,
+    isLyricsEnabled: Boolean,
+    currentLyricLine: String,
     onToggleTorch: () -> Unit
 ) {
     val context = LocalContext.current
@@ -479,7 +734,6 @@ private fun CompactSingleView(
                         AlertIconType.RINGER_SILENT -> Icons.AutoMirrored.Filled.VolumeOff
                         AlertIconType.RINGER_VIBRATE -> Icons.Default.Vibration
                         AlertIconType.TORCH -> Icons.Default.FlashlightOn
-                        AlertIconType.HOTSPOT -> Icons.Default.WifiTethering
                         else -> Icons.Default.Notifications
                     },
                     contentDescription = null,
@@ -500,12 +754,16 @@ private fun CompactSingleView(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
+                if (payload.iconType == AlertIconType.CHARGING) {
+                    ProceduralAudioWaveform(isPlaying = true, tint = payload.accentColor)
+                }
             }
 
             is IslandPayload.MediaActivity -> {
                 if (payload.albumArt != null) {
+                    val artImg = remember(payload.trackTitle, payload.albumArt) { payload.albumArt.asImageBitmap() }
                     Image(
-                        bitmap = payload.albumArt.asImageBitmap(),
+                        bitmap = artImg,
                         contentDescription = null,
                         modifier = Modifier
                             .size(22.dp)
@@ -520,14 +778,32 @@ private fun CompactSingleView(
                     )
                 }
                 Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = payload.trackTitle,
-                    color = Color.White,
-                    fontSize = 11.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
+
+                val pillDisplayLine = if (isLyricsEnabled && currentLyricLine.isNotBlank()) {
+                    "♪ $currentLyricLine"
+                } else {
+                    payload.trackTitle
+                }
+
+                AnimatedContent(
+                    targetState = pillDisplayLine,
+                    transitionSpec = {
+                        (slideInVertically { h -> -h } + fadeIn())
+                            .togetherWith(slideOutVertically { h -> h } + fadeOut())
+                    },
+                    modifier = Modifier.weight(1f),
+                    label = "lyric_pill_roll"
+                ) { line ->
+                    Text(
+                        text = line,
+                        color = if (isLyricsEnabled && currentLyricLine.isNotBlank()) payload.accentColor else Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = if (isLyricsEnabled && currentLyricLine.isNotBlank()) FontWeight.Bold else FontWeight.Normal,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
                 Spacer(modifier = Modifier.width(6.dp))
                 ProceduralAudioWaveform(
                     isPlaying = payload.isPlaying,
@@ -537,8 +813,9 @@ private fun CompactSingleView(
 
             is IslandPayload.LiveProgressActivity -> {
                 if (payload.appIcon != null) {
+                    val iconImg = remember(payload.id) { payload.appIcon.asImageBitmap() }
                     Image(
-                        bitmap = payload.appIcon.asImageBitmap(),
+                        bitmap = iconImg,
                         contentDescription = null,
                         modifier = Modifier
                             .size(20.dp)
@@ -573,8 +850,9 @@ private fun CompactSingleView(
 
             is IslandPayload.CommunicationActivity -> {
                 if (payload.avatar != null) {
+                    val avatarImg = remember(payload.id) { payload.avatar.asImageBitmap() }
                     Image(
-                        bitmap = payload.avatar.asImageBitmap(),
+                        bitmap = avatarImg,
                         contentDescription = null,
                         modifier = Modifier
                             .size(22.dp)
@@ -606,15 +884,20 @@ private fun CompactSingleView(
                     modifier = Modifier
                         .fillMaxSize()
                         .clickable {
-                            payload.primaryIntent?.let { context.startActivity(it) }
+                            try {
+                                payload.primaryIntent?.let { context.startActivity(it) }
+                            } catch (e: Exception) {}
                             IslandStateEngine.removePayload(payload.id)
                         },
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     if (firstApp != null) {
+                        val appIconBmp = remember(firstApp.packageName) {
+                            firstApp.icon.toComposeBitmap(64).asImageBitmap()
+                        }
                         Image(
-                            bitmap = firstApp.icon.toComposeBitmap(64).asImageBitmap(),
+                            bitmap = appIconBmp,
                             contentDescription = firstApp.label,
                             modifier = Modifier
                                 .size(22.dp)
@@ -656,6 +939,8 @@ private fun CompactSingleView(
 @Composable
 private fun ExpandedIslandCard(
     payload: IslandPayload,
+    isLyricsEnabled: Boolean,
+    currentLyricLine: String,
     onCollapse: () -> Unit,
     onMinimizeToHole: () -> Unit,
     onOpenQuickTools: () -> Unit,
@@ -677,12 +962,13 @@ private fun ExpandedIslandCard(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     if (payload.albumArt != null) {
+                        val artImg = remember(payload.trackTitle, payload.albumArt) { payload.albumArt.asImageBitmap() }
                         Image(
-                            bitmap = payload.albumArt.asImageBitmap(),
+                            bitmap = artImg,
                             contentDescription = null,
                             modifier = Modifier
-                                .size(50.dp)
-                                .clip(RoundedCornerShape(14.dp))
+                                .size(46.dp)
+                                .clip(RoundedCornerShape(12.dp))
                                 .clickable {
                                     launchPayloadIntent(context, payload)
                                     onCollapse()
@@ -694,7 +980,7 @@ private fun ExpandedIslandCard(
                         Text(
                             text = payload.trackTitle,
                             color = Color.White,
-                            fontSize = 15.sp,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -702,19 +988,18 @@ private fun ExpandedIslandCard(
                         Text(
                             text = payload.artist,
                             color = Color.White.copy(alpha = 0.7f),
-                            fontSize = 12.sp,
+                            fontSize = 11.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
                     }
-                    // Open Spotify App Explicitly Button
                     IconButton(
                         onClick = {
                             launchPayloadIntent(context, payload)
                             onCollapse()
                         },
                         modifier = Modifier
-                            .size(30.dp)
+                            .size(28.dp)
                             .clip(CircleShape)
                             .background(Color(0xFF1E293B))
                     ) {
@@ -722,15 +1007,14 @@ private fun ExpandedIslandCard(
                             imageVector = Icons.AutoMirrored.Filled.OpenInNew,
                             contentDescription = null,
                             tint = payload.accentColor,
-                            modifier = Modifier.size(15.dp)
+                            modifier = Modifier.size(14.dp)
                         )
                     }
                     Spacer(modifier = Modifier.width(6.dp))
-                    // Quick Tools Button
                     IconButton(
                         onClick = onOpenQuickTools,
                         modifier = Modifier
-                            .size(30.dp)
+                            .size(28.dp)
                             .clip(CircleShape)
                             .background(Color(0xFF1E293B))
                     ) {
@@ -738,15 +1022,14 @@ private fun ExpandedIslandCard(
                             imageVector = Icons.Default.Tune,
                             contentDescription = null,
                             tint = Color(0xFF38BDF8),
-                            modifier = Modifier.size(15.dp)
+                            modifier = Modifier.size(14.dp)
                         )
                     }
                     Spacer(modifier = Modifier.width(6.dp))
-                    // Collapse to Pill Button
                     IconButton(
                         onClick = onCollapse,
                         modifier = Modifier
-                            .size(30.dp)
+                            .size(28.dp)
                             .clip(CircleShape)
                             .background(Color(0xFF1E293B))
                     ) {
@@ -754,12 +1037,42 @@ private fun ExpandedIslandCard(
                             imageVector = Icons.Default.KeyboardArrowUp,
                             contentDescription = null,
                             tint = Color.White,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(16.dp)
                         )
                     }
                 }
 
-                // Interactive Scrubbing / Seek Slider
+                if (isLyricsEnabled) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0xFF0F172A))
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AnimatedContent(
+                            targetState = currentLyricLine.ifBlank { "♪ Instrumental / Syncing Lyrics..." },
+                            transitionSpec = {
+                                (slideInVertically { h -> -h } + fadeIn())
+                                    .togetherWith(slideOutVertically { h -> h } + fadeOut())
+                            },
+                            label = "expanded_lyric_roll"
+                        ) { line ->
+                            Text(
+                                text = line,
+                                color = if (currentLyricLine.isNotBlank()) payload.accentColor else Color.Gray,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+                }
+
                 Slider(
                     value = payload.progress,
                     onValueChange = { newFraction ->
@@ -774,31 +1087,30 @@ private fun ExpandedIslandCard(
                     ),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(22.dp)
+                        .height(20.dp)
                 )
 
-                // Song Control Buttons + Minimize to Camera Ring Button
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = { payload.onPrevious?.invoke() }) {
-                        Icon(Icons.Default.SkipPrevious, contentDescription = null, tint = Color.White, modifier = Modifier.size(30.dp))
+                        Icon(Icons.Default.SkipPrevious, contentDescription = null, tint = Color.White, modifier = Modifier.size(28.dp))
                     }
                     IconButton(onClick = { payload.onPlayPause?.invoke() }) {
                         Icon(
                             if (payload.isPlaying) Icons.Default.PauseCircleFilled else Icons.Default.PlayCircleFilled,
                             contentDescription = null,
                             tint = Color.White,
-                            modifier = Modifier.size(44.dp)
+                            modifier = Modifier.size(40.dp)
                         )
                     }
                     IconButton(onClick = { payload.onNext?.invoke() }) {
-                        Icon(Icons.Default.SkipNext, contentDescription = null, tint = Color.White, modifier = Modifier.size(30.dp))
+                        Icon(Icons.Default.SkipNext, contentDescription = null, tint = Color.White, modifier = Modifier.size(28.dp))
                     }
                     IconButton(onClick = onMinimizeToHole) {
-                        Icon(Icons.Default.VisibilityOff, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(20.dp))
+                        Icon(Icons.Default.VisibilityOff, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(18.dp))
                     }
                 }
             }
@@ -811,11 +1123,7 @@ private fun ExpandedIslandCard(
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
-                            imageVector = if (payload.iconType == AlertIconType.HOTSPOT) {
-                                Icons.Default.WifiTethering
-                            } else {
-                                Icons.Default.Notifications
-                            },
+                            imageVector = Icons.Default.Notifications,
                             contentDescription = null,
                             tint = payload.accentColor,
                             modifier = Modifier.size(28.dp)
@@ -846,7 +1154,7 @@ private fun ExpandedIslandCard(
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("Open Direct Quick Toggles", color = Color.White)
+                    Text("Open Quick Tools & App Dock", color = Color.White)
                 }
             }
 
@@ -857,8 +1165,9 @@ private fun ExpandedIslandCard(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     if (payload.avatar != null) {
+                        val avatarImg = remember(payload.id) { payload.avatar.asImageBitmap() }
                         Image(
-                            bitmap = payload.avatar.asImageBitmap(),
+                            bitmap = avatarImg,
                             contentDescription = null,
                             modifier = Modifier
                                 .size(44.dp)
@@ -886,7 +1195,7 @@ private fun ExpandedIslandCard(
                             payload.acceptIntent?.let { accept ->
                                 IconButton(
                                     onClick = {
-                                        try { accept.send() } catch (_: Exception) {}
+                                        try { accept.send() } catch (e: Exception) {}
                                         onCollapse()
                                     },
                                     modifier = Modifier.background(Color(0xFF22C55E), CircleShape)
@@ -897,7 +1206,7 @@ private fun ExpandedIslandCard(
                             payload.declineIntent?.let { decline ->
                                 IconButton(
                                     onClick = {
-                                        try { decline.send() } catch (_: Exception) {}
+                                        try { decline.send() } catch (e: Exception) {}
                                         onCollapse()
                                     },
                                     modifier = Modifier.background(Color(0xFFEF4444), CircleShape)
@@ -995,7 +1304,9 @@ private fun ExpandedIslandCard(
                 OriginDragAppsDock(
                     targetApps = payload.targetApps,
                     onAppClick = { app ->
-                        context.startActivity(app.launchIntent)
+                        try {
+                            context.startActivity(app.launchIntent)
+                        } catch (e: Exception) {}
                         onCollapse()
                     }
                 )
@@ -1019,6 +1330,9 @@ private fun OriginDragAppsDock(
         verticalAlignment = Alignment.CenterVertically
     ) {
         targetApps.forEach { app ->
+            val cachedIcon = remember(app.packageName) {
+                app.icon.toComposeBitmap(96).asImageBitmap()
+            }
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
@@ -1026,7 +1340,7 @@ private fun OriginDragAppsDock(
                     .padding(4.dp)
             ) {
                 Image(
-                    bitmap = app.icon.toComposeBitmap(96).asImageBitmap(),
+                    bitmap = cachedIcon,
                     contentDescription = app.label,
                     modifier = Modifier
                         .size(44.dp)
@@ -1045,9 +1359,6 @@ private fun OriginDragAppsDock(
     }
 }
 
-/**
- * Feature 3: Direct One-Tap ON/OFF Hardware Toggles + Dual Volume & Brightness Sliders
- */
 @Composable
 private fun IdleQuickToolsDock(
     quickTileStates: QuickTileStates,
@@ -1055,22 +1366,50 @@ private fun IdleQuickToolsDock(
     stashItems: List<StashItem>,
     onToggleTorch: () -> Unit,
     onToggleBluetooth: () -> Unit,
-    onToggleHotspot: () -> Unit,
     onToggleAutoRotate: () -> Unit,
     onToggleRingerMode: () -> Unit,
+    onTakeScreenshot: () -> Unit,
+    onLockScreen: () -> Unit,
     onSetVolumeFraction: (Float) -> Unit,
-    onSetBrightnessFraction: (Float) -> Unit,
     onPasteText: (String) -> Unit,
     onClose: () -> Unit
 ) {
+    val context = LocalContext.current
     val view = LocalView.current
+
+    val defaultShortcuts = remember {
+        val pkgs = listOf(
+            "com.spotify.music",
+            "com.whatsapp",
+            "com.google.android.youtube",
+            "com.android.chrome",
+            "com.google.android.dialer"
+        )
+        val pm = context.packageManager
+        pkgs.mapNotNull { pkg ->
+            try {
+                val info = pm.getApplicationInfo(pkg, 0)
+                val intent = pm.getLaunchIntentForPackage(pkg)?.apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                } ?: return@mapNotNull null
+                TargetAppInfo(
+                    label = pm.getApplicationLabel(info).toString(),
+                    packageName = pkg,
+                    icon = pm.getApplicationIcon(info),
+                    launchIntent = intent
+                )
+            } catch (e: Exception) {
+                null
+            }
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(6.dp),
         verticalArrangement = Arrangement.SpaceBetween
     ) {
-        // Row 1: 5 Direct ON/OFF Hardware Toggles + Close Button
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -1094,16 +1433,6 @@ private fun IdleQuickToolsDock(
                 onClick = {
                     view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                     onToggleBluetooth()
-                }
-            )
-            QuickSettingCircleTile(
-                icon = Icons.Default.WifiTethering,
-                label = if (quickTileStates.isHotspotOn) "ON" else "OFF",
-                isActive = quickTileStates.isHotspotOn,
-                activeColor = Color(0xFF22C55E),
-                onClick = {
-                    view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                    onToggleHotspot()
                 }
             )
             QuickSettingCircleTile(
@@ -1134,6 +1463,13 @@ private fun IdleQuickToolsDock(
                     onToggleRingerMode()
                 }
             )
+            QuickSettingCircleTile(
+                icon = Icons.Default.Screenshot,
+                label = "Shot",
+                isActive = false,
+                activeColor = Color(0xFF38BDF8),
+                onClick = onTakeScreenshot
+            )
             IconButton(
                 onClick = onClose,
                 modifier = Modifier
@@ -1145,97 +1481,110 @@ private fun IdleQuickToolsDock(
             }
         }
 
-        // Row 2: Direct In-Island Volume & Brightness Sliders
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Row(
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                contentDescription = null,
+                tint = Color(0xFF38BDF8),
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Slider(
+                value = quickTileStates.volumeFraction,
+                onValueChange = onSetVolumeFraction,
+                colors = SliderDefaults.colors(
+                    thumbColor = Color(0xFF38BDF8),
+                    activeTrackColor = Color(0xFF38BDF8),
+                    inactiveTrackColor = Color(0xFF1E293B)
+                ),
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.VolumeUp,
-                    contentDescription = null,
-                    tint = Color(0xFF38BDF8),
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Slider(
-                    value = quickTileStates.volumeFraction,
-                    onValueChange = onSetVolumeFraction,
-                    colors = SliderDefaults.colors(
-                        thumbColor = Color(0xFF38BDF8),
-                        activeTrackColor = Color(0xFF38BDF8),
-                        inactiveTrackColor = Color(0xFF1E293B)
-                    ),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(18.dp)
-                )
-            }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Brightness6,
-                    contentDescription = null,
-                    tint = Color(0xFFFACC15),
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Slider(
-                    value = quickTileStates.brightnessFraction,
-                    onValueChange = onSetBrightnessFraction,
-                    colors = SliderDefaults.colors(
-                        thumbColor = Color(0xFFFACC15),
-                        activeTrackColor = Color(0xFFFACC15),
-                        inactiveTrackColor = Color(0xFF1E293B)
-                    ),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(18.dp)
-                )
-            }
+                    .weight(1f)
+                    .height(20.dp)
+            )
         }
 
-        // Row 3: Clipboard & Stash Quick Paste Chips
-        if (clipboardHistory.isNotEmpty() || stashItems.isNotEmpty()) {
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(clipboardHistory) { clipText ->
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            item {
+                QuickSettingCircleTile(
+                    icon = Icons.Default.Lock,
+                    label = "Lock",
+                    isActive = false,
+                    activeColor = Color(0xFFEF4444),
+                    onClick = onLockScreen
+                )
+            }
+            items(defaultShortcuts, key = { it.packageName }) { app ->
+                val cachedAppBitmap = remember(app.packageName) {
+                    app.icon.toComposeBitmap(84).asImageBitmap()
+                }
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.clickable {
+                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        try {
+                            context.startActivity(app.launchIntent)
+                            onClose()
+                        } catch (e: Exception) {}
+                    }
+                ) {
+                    Image(
+                        bitmap = cachedAppBitmap,
+                        contentDescription = app.label,
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .border(1.dp, Color(0xFF334155), CircleShape)
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = app.label.take(7),
+                        color = Color.LightGray,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            items(clipboardHistory) { clipText ->
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xFF1E293B))
+                        .clickable { onPasteText(clipText) }
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = "📋 ${clipText.take(18)}",
+                        color = Color.White,
+                        fontSize = 10.sp,
+                        maxLines = 1
+                    )
+                }
+            }
+            items(stashItems) { stash ->
+                stash.text?.let { text ->
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(14.dp))
-                            .background(Color(0xFF1E293B))
-                            .clickable { onPasteText(clipText) }
-                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                            .background(Color(0xFF312E81))
+                            .clickable { onPasteText(text) }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
                     ) {
                         Text(
-                            text = clipText.take(28),
+                            text = text.take(18),
                             color = Color.White,
-                            fontSize = 11.sp,
+                            fontSize = 10.sp,
                             maxLines = 1
                         )
-                    }
-                }
-                items(stashItems) { stash ->
-                    stash.text?.let { text ->
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(Color(0xFF312E81))
-                                .clickable { onPasteText(text) }
-                                .padding(horizontal = 10.dp, vertical = 5.dp)
-                        ) {
-                            Text(
-                                text = text.take(28),
-                                color = Color.White,
-                                fontSize = 11.sp,
-                                maxLines = 1
-                            )
-                        }
                     }
                 }
             }
@@ -1257,7 +1606,7 @@ private fun QuickSettingCircleTile(
     ) {
         Box(
             modifier = Modifier
-                .size(44.dp)
+                .size(42.dp)
                 .clip(CircleShape)
                 .background(if (isActive) activeColor.copy(alpha = 0.24f) else Color(0xFF1E293B))
                 .border(
@@ -1271,7 +1620,7 @@ private fun QuickSettingCircleTile(
                 imageVector = icon,
                 contentDescription = null,
                 tint = if (isActive) activeColor else Color.White,
-                modifier = Modifier.size(21.dp)
+                modifier = Modifier.size(20.dp)
             )
         }
         Spacer(modifier = Modifier.height(2.dp))
@@ -1290,7 +1639,7 @@ private fun ProceduralAudioWaveform(isPlaying: Boolean, tint: Color) {
 
     LaunchedEffect(isPlaying) {
         while (isPlaying) {
-            delay(33L)
+            delay(40L)
             phase += 0.35f
         }
     }
@@ -1344,7 +1693,7 @@ private fun launchPayloadIntent(context: Context, payload: IslandPayload) {
             is IslandPayload.OriginAiSuggestion -> payload.primaryIntent?.let { context.startActivity(it) }
             else -> {}
         }
-    } catch (_: Exception) {
+    } catch (e: Exception) {
     }
 }
 
@@ -1362,6 +1711,6 @@ private fun sendInlineReply(
     RemoteInput.addResultsToIntent(arrayOf(remoteInput), intent, bundle)
     try {
         actionIntent.send(context, 0, intent)
-    } catch (_: Exception) {
+    } catch (e: Exception) {
     }
 }

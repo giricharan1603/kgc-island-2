@@ -56,15 +56,30 @@ class IslandAccessibilityService : AccessibilityService(),
     private var composeOverlayView: ComposeView? = null
     private var isViewAttached = false
     private var isLifecycleInitialized = false
+    private var isReceiverRegistered = false
 
     private lateinit var cameraManager: CameraManager
     private lateinit var audioManager: AudioManager
     private lateinit var clipboardManager: ClipboardManager
+    private lateinit var sharedPrefs: SharedPreferences
     private var bluetoothManager: BluetoothManager? = null
     private var currentTorchCameraId: String? = null
     private var isTorchOn = false
-    private var isHotspotOn = false
     private var lastProcessedClip: String = ""
+    private var lastClipboardCheckTimeMs = 0L
+
+    private var hasCustomPortraitPos = false
+    private var hasCustomLandscapePos = false
+
+    private val prefsChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "idle_text_enabled" || key == "idle_custom_text") {
+            applyOverlayWindowLayout(
+                IslandStateEngine.displayMode.value,
+                IslandStateEngine.cutoutConfig.value,
+                IslandStateEngine.privacyState.value
+            )
+        }
+    }
 
     private val rotationObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean) {
@@ -81,6 +96,10 @@ class IslandAccessibilityService : AccessibilityService(),
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         clipboardManager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
         bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as? BluetoothManager
+        sharedPrefs = getSharedPreferences("kgc_island2_prefs", Context.MODE_PRIVATE)
+        sharedPrefs.registerOnSharedPreferenceChangeListener(prefsChangeListener)
+
+        loadSavedDragPositions()
     }
 
     private fun initLifecycleIfNeeded() {
@@ -89,8 +108,66 @@ class IslandAccessibilityService : AccessibilityService(),
             try {
                 savedStateRegistryController.performRestore(null)
                 lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
             }
+        }
+    }
+
+    private fun loadSavedDragPositions() {
+        try {
+            hasCustomPortraitPos = sharedPrefs.getBoolean("has_custom_port", false)
+            hasCustomLandscapePos = sharedPrefs.getBoolean("has_custom_land", false)
+            val current = IslandStateEngine.cutoutConfig.value
+            val savedSize = sharedPrefs.getInt("circle_size_dp", current.idleCircleSizeDp)
+            IslandStateEngine.updateCutoutConfig(
+                current.copy(
+                    offsetX = sharedPrefs.getInt("port_x", current.offsetX),
+                    offsetY = sharedPrefs.getInt("port_y", current.offsetY),
+                    landscapeCutoutX = sharedPrefs.getInt("land_x", current.landscapeCutoutX),
+                    landscapeCutoutY = sharedPrefs.getInt("land_y", current.landscapeCutoutY),
+                    baseWidthDp = savedSize,
+                    baseHeightDp = savedSize,
+                    idleCircleSizeDp = savedSize
+                )
+            )
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun handleHoldAndDragInMemory(deltaX: Int, deltaY: Int) {
+        val cur = IslandStateEngine.cutoutConfig.value
+        val updated = if (cur.isLandscape) {
+            hasCustomLandscapePos = true
+            val nextX = if (cur.landscapeRotation == Surface.ROTATION_270) {
+                (cur.landscapeCutoutX - deltaX).coerceIn(-600, 1200)
+            } else {
+                (cur.landscapeCutoutX + deltaX).coerceIn(-600, 1200)
+            }
+            val nextY = (cur.landscapeCutoutY + deltaY).coerceIn(-500, 500)
+            cur.copy(landscapeCutoutX = nextX, landscapeCutoutY = nextY)
+        } else {
+            hasCustomPortraitPos = true
+            val nextX = (cur.offsetX + deltaX).coerceIn(-500, 500)
+            val nextY = (cur.offsetY + deltaY).coerceIn(-40, 800)
+            cur.copy(offsetX = nextX, offsetY = nextY)
+        }
+        IslandStateEngine.updateCutoutConfig(updated)
+    }
+
+    private fun saveHoldAndDragToDisk() {
+        try {
+            val cfg = IslandStateEngine.cutoutConfig.value
+            sharedPrefs.edit().apply {
+                putInt("port_x", cfg.offsetX)
+                putInt("port_y", cfg.offsetY)
+                putInt("land_x", cfg.landscapeCutoutX)
+                putInt("land_y", cfg.landscapeCutoutY)
+                putInt("circle_size_dp", cfg.idleCircleSizeDp)
+                putBoolean("has_custom_port", hasCustomPortraitPos)
+                putBoolean("has_custom_land", hasCustomLandscapePos)
+                apply()
+            }
+        } catch (e: Exception) {
         }
     }
 
@@ -102,10 +179,14 @@ class IslandAccessibilityService : AccessibilityService(),
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
 
             setupOverlayWindow()
-            registerHardwareAndSystemCallbacks()
-            syncQuickTileStates()
             observeDisplayModeForWindowSizing()
-        } catch (_: Exception) {
+
+            serviceScope.launch {
+                delay(250L)
+                registerHardwareAndSystemCallbacks()
+                syncQuickTileStates()
+            }
+        } catch (e: Exception) {
         }
     }
 
@@ -216,16 +297,35 @@ class IslandAccessibilityService : AccessibilityService(),
                         performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
                     },
                     onToggleTorch = { toggleFlashlightDirectly() },
-                    onToggleBluetooth = { toggleBluetoothDirectly() },
-                    onToggleHotspot = { toggleHotspotDirectly() },
+                    onToggleBluetooth = { toggleBluetoothSilently() },
                     onToggleAutoRotate = { toggleAutoRotateDirectly() },
                     onToggleRingerMode = { toggleRingerModeDirectly() },
+                    onTakeScreenshot = {
+                        IslandStateEngine.collapseIsland()
+                        serviceScope.launch {
+                            delay(220L)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
+                            }
+                        }
+                    },
+                    onLockScreen = {
+                        IslandStateEngine.collapseIsland()
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+                        }
+                    },
                     onSetVolumeFraction = { fraction -> setMusicVolumeFraction(fraction) },
-                    onSetBrightnessFraction = { fraction -> setScreenBrightnessFraction(fraction) },
                     onAdjustVolume = { delta ->
                         val direction = if (delta > 0) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
                         audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, direction, 0)
                         syncQuickTileStates()
+                    },
+                    onDragReposition = { dx, dy ->
+                        handleHoldAndDragInMemory(dx.roundToInt(), dy.roundToInt())
+                    },
+                    onDragRepositionEnd = {
+                        saveHoldAndDragToDisk()
                     },
                     onRequestKeyboardFocus = { needsFocus ->
                         setWindowKeyboardFocusable(needsFocus)
@@ -240,14 +340,10 @@ class IslandAccessibilityService : AccessibilityService(),
         try {
             windowManager.addView(composeOverlayView, windowParams)
             isViewAttached = true
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
-    /**
-     * Safe for Android 13: Uses view.display or windowManager.defaultDisplay instead of Service.getDisplay()
-     * so Android 13 never throws UnsupportedOperationException!
-     */
     private fun detectCutoutAndOrientation() {
         try {
             val v = composeOverlayView ?: return
@@ -273,14 +369,14 @@ class IslandAccessibilityService : AccessibilityService(),
                 circleDp = detectedDp.coerceIn(26, 48)
                 val circlePx = (circleDp * density).roundToInt()
 
-                if (isLandscape) {
+                if (isLandscape && !hasCustomLandscapePos) {
                     landX = if (rotation == Surface.ROTATION_270) {
                         (screenW - rect.centerX() - (circlePx / 2)).coerceAtLeast(8)
                     } else {
                         (rect.centerX() - (circlePx / 2)).coerceAtLeast(8)
                     }
                     landY = rect.centerY() - (screenH / 2)
-                } else {
+                } else if (!isLandscape && !hasCustomPortraitPos) {
                     portX = rect.centerX() - (screenW / 2)
                     portY = rect.top.coerceAtLeast(6)
                 }
@@ -299,7 +395,7 @@ class IslandAccessibilityService : AccessibilityService(),
                     landscapeCutoutY = landY
                 )
             )
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
@@ -312,54 +408,66 @@ class IslandAccessibilityService : AccessibilityService(),
             ) { mode: IslandDisplayMode, config: CutoutConfig, privacy: PrivacyIndicatorState ->
                 Triple(mode, config, privacy)
             }.collectLatest { (mode, config, privacy) ->
-                if (!isViewAttached || composeOverlayView == null) return@collectLatest
-                val density = resources.displayMetrics.density
-
-                val (targetW, targetH) = when (mode) {
-                    IslandDisplayMode.IDLE -> {
-                        val basePx = (config.idleCircleSizeDp * density).toInt()
-                        val widthPx = if (privacy.isCameraActive || privacy.isMicActive) {
-                            basePx + (18 * density).toInt()
-                        } else {
-                            basePx
-                        }
-                        Pair(widthPx, basePx)
-                    }
-                    IslandDisplayMode.COMPACT_SINGLE -> Pair((215 * density).toInt(), (38 * density).toInt())
-                    IslandDisplayMode.COMPACT_SPLIT -> Pair((268 * density).toInt(), (38 * density).toInt())
-                    IslandDisplayMode.EXPANDED_CARD,
-                    IslandDisplayMode.ORIGIN_DRAG_WHEEL,
-                    IslandDisplayMode.QUICK_TOOLS -> Pair((364 * density).toInt(), (226 * density).toInt())
-                }
-
-                windowParams.width = targetW
-                windowParams.height = targetH
-
-                if (config.isLandscape && mode == IslandDisplayMode.IDLE) {
-                    if (config.landscapeRotation == Surface.ROTATION_270) {
-                        windowParams.gravity = Gravity.CENTER_VERTICAL or Gravity.END
-                        windowParams.x = config.landscapeCutoutX
-                        windowParams.y = config.landscapeCutoutY
-                    } else {
-                        windowParams.gravity = Gravity.CENTER_VERTICAL or Gravity.START
-                        windowParams.x = config.landscapeCutoutX
-                        windowParams.y = config.landscapeCutoutY
-                    }
-                } else if (config.isLandscape) {
-                    windowParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                    windowParams.x = 0
-                    windowParams.y = (10 * density).toInt()
-                } else {
-                    windowParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-                    windowParams.x = config.offsetX
-                    windowParams.y = config.offsetY
-                }
-
-                try {
-                    windowManager.updateViewLayout(composeOverlayView, windowParams)
-                } catch (_: Exception) {
-                }
+                applyOverlayWindowLayout(mode, config, privacy)
             }
+        }
+    }
+
+    private fun applyOverlayWindowLayout(
+        mode: IslandDisplayMode,
+        config: CutoutConfig,
+        privacy: PrivacyIndicatorState
+    ) {
+        if (!isViewAttached || composeOverlayView == null) return
+        val density = resources.displayMetrics.density
+        val idleTextEnabled = sharedPrefs.getBoolean("idle_text_enabled", false)
+        val idleCustomText = sharedPrefs.getString("idle_custom_text", "").orEmpty()
+
+        val (targetW, targetH) = when (mode) {
+            IslandDisplayMode.IDLE -> {
+                val basePx = (config.idleCircleSizeDp * density).toInt()
+                val extraTextWidth = if (idleTextEnabled && idleCustomText.isNotBlank()) {
+                    (128 * density).toInt()
+                } else if (privacy.isCameraActive || privacy.isMicActive) {
+                    (18 * density).toInt()
+                } else {
+                    0
+                }
+                Pair(basePx + extraTextWidth, basePx)
+            }
+            IslandDisplayMode.COMPACT_SINGLE -> Pair((225 * density).toInt(), (40 * density).toInt())
+            IslandDisplayMode.COMPACT_SPLIT -> Pair((276 * density).toInt(), (40 * density).toInt())
+            IslandDisplayMode.EXPANDED_CARD,
+            IslandDisplayMode.ORIGIN_DRAG_WHEEL,
+            IslandDisplayMode.QUICK_TOOLS -> Pair((364 * density).toInt(), (236 * density).toInt())
+        }
+
+        windowParams.width = targetW
+        windowParams.height = targetH
+
+        if (config.isLandscape && mode == IslandDisplayMode.IDLE) {
+            if (config.landscapeRotation == Surface.ROTATION_270) {
+                windowParams.gravity = Gravity.CENTER_VERTICAL or Gravity.END
+                windowParams.x = config.landscapeCutoutX
+                windowParams.y = config.landscapeCutoutY
+            } else {
+                windowParams.gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                windowParams.x = config.landscapeCutoutX
+                windowParams.y = config.landscapeCutoutY
+            }
+        } else if (config.isLandscape) {
+            windowParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            windowParams.x = config.landscapeCutoutY
+            windowParams.y = (10 * density).toInt()
+        } else {
+            windowParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            windowParams.x = config.offsetX
+            windowParams.y = config.offsetY
+        }
+
+        try {
+            windowManager.updateViewLayout(composeOverlayView, windowParams)
+        } catch (e: Exception) {
         }
     }
 
@@ -372,11 +480,15 @@ class IslandAccessibilityService : AccessibilityService(),
         }
         try {
             windowManager.updateViewLayout(composeOverlayView, windowParams)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
     private fun captureClipboardWithBriefFocus() {
+        val now = System.currentTimeMillis()
+        if (now - lastClipboardCheckTimeMs < 500L) return
+        lastClipboardCheckTimeMs = now
+
         serviceScope.launch {
             try {
                 setWindowKeyboardFocusable(true)
@@ -389,7 +501,7 @@ class IslandAccessibilityService : AccessibilityService(),
                         OriginAiProcessor.processCopiedText(this@IslandAccessibilityService, copied)
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
             } finally {
                 setWindowKeyboardFocusable(false)
             }
@@ -400,32 +512,25 @@ class IslandAccessibilityService : AccessibilityService(),
         try {
             val btOn = try {
                 bluetoothManager?.adapter?.isEnabled == true
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 false
             }
             val rotateOn = try {
                 Settings.System.getInt(contentResolver, Settings.System.ACCELEROMETER_ROTATION, 0) == 1
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 false
             }
             val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
             val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
-            val curBright = try {
-                Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128)
-            } catch (_: Exception) {
-                128
-            }
 
             IslandStateEngine.updateQuickTileState(
                 torch = isTorchOn,
                 bluetooth = btOn,
-                hotspot = isHotspotOn,
                 autoRotate = rotateOn,
                 ringerMode = audioManager.ringerMode,
-                volumeFraction = (curVol.toFloat() / maxVol.toFloat()).coerceIn(0f, 1f),
-                brightnessFraction = (curBright.toFloat() / 255f).coerceIn(0.05f, 1f)
+                volumeFraction = (curVol.toFloat() / maxVol.toFloat()).coerceIn(0f, 1f)
             )
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
@@ -450,7 +555,7 @@ class IslandAccessibilityService : AccessibilityService(),
                     IslandStateEngine.updateQuickTileState(torch = enabled)
                 }
             }, mainHandler)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
 
         try {
@@ -459,7 +564,7 @@ class IslandAccessibilityService : AccessibilityService(),
                     IslandStateEngine.updatePrivacyDots(mic = !configs.isNullOrEmpty())
                 }
             }, mainHandler)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
 
         try {
@@ -468,7 +573,7 @@ class IslandAccessibilityService : AccessibilityService(),
                 false,
                 rotationObserver
             )
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
 
         try {
@@ -484,28 +589,30 @@ class IslandAccessibilityService : AccessibilityService(),
                             }
                         }
                     }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
 
-        try {
-            val filter = IntentFilter().apply {
-                addAction(Intent.ACTION_SCREEN_OFF)
-                addAction(Intent.ACTION_SCREEN_ON)
-                addAction(Intent.ACTION_POWER_CONNECTED)
-                addAction(Intent.ACTION_BATTERY_LOW)
-                addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
-                addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
-                addAction("android.net.wifi.WIFI_AP_STATE_CHANGED")
+        if (!isReceiverRegistered) {
+            try {
+                val filter = IntentFilter().apply {
+                    addAction(Intent.ACTION_SCREEN_OFF)
+                    addAction(Intent.ACTION_SCREEN_ON)
+                    addAction(Intent.ACTION_POWER_CONNECTED)
+                    addAction(Intent.ACTION_BATTERY_LOW)
+                    addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
+                    addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    registerReceiver(systemEventReceiver, filter, Context.RECEIVER_EXPORTED)
+                } else {
+                    registerReceiver(systemEventReceiver, filter)
+                }
+                isReceiverRegistered = true
+            } catch (e: Exception) {
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                registerReceiver(systemEventReceiver, filter, Context.RECEIVER_EXPORTED)
-            } else {
-                registerReceiver(systemEventReceiver, filter)
-            }
-        } catch (_: Exception) {
         }
     }
 
@@ -525,39 +632,21 @@ class IslandAccessibilityService : AccessibilityService(),
                     BluetoothAdapter.ACTION_STATE_CHANGED -> {
                         syncQuickTileStates()
                     }
-                    "android.net.wifi.WIFI_AP_STATE_CHANGED" -> {
-                        val state = intent.getIntExtra("wifi_state", 0)
-                        isHotspotOn = (state == 13 || state == 12)
-                        IslandStateEngine.updateQuickTileState(hotspot = isHotspotOn)
-                        if (state == 13) {
-                            IslandStateEngine.submitPayload(
-                                IslandPayload.SystemAlert(
-                                    id = "hotspot_active",
-                                    title = "Hotspot",
-                                    subtitle = "Active",
-                                    accentColor = Color(0xFF22C55E),
-                                    iconType = AlertIconType.HOTSPOT,
-                                    isOngoing = true
-                                )
-                            )
-                        } else if (state == 11 || state == 14) {
-                            IslandStateEngine.removePayload("hotspot_active")
-                        }
-                    }
                     Intent.ACTION_POWER_CONNECTED -> {
                         val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
                         val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
                         val currentNowMicroAmps = kotlin.math.abs(bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW))
                         val currentMa = (currentNowMicroAmps / 1000).toInt()
-                        val sub = if (currentMa > 0) "$level% • ${currentMa}mA" else "$level%"
+                        val sub = if (currentMa > 0) "Super Charge • ${currentMa}mA" else "Charging Active"
 
                         IslandStateEngine.submitPayload(
                             IslandPayload.SystemAlert(
                                 id = "charging",
-                                title = "$level%",
+                                title = "⚡ $level%",
                                 subtitle = sub,
                                 accentColor = Color(0xFF4ADE80),
-                                iconType = AlertIconType.CHARGING
+                                iconType = AlertIconType.CHARGING,
+                                autoDismissMs = 6500L
                             )
                         )
                     }
@@ -570,7 +659,8 @@ class IslandAccessibilityService : AccessibilityService(),
                                 title = "$level%",
                                 subtitle = "Battery Low",
                                 accentColor = Color(0xFFEF4444),
-                                iconType = AlertIconType.LOW_BATTERY
+                                iconType = AlertIconType.LOW_BATTERY,
+                                autoDismissMs = 5500L
                             )
                         )
                     }
@@ -595,7 +685,7 @@ class IslandAccessibilityService : AccessibilityService(),
                         )
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
             }
         }
     }
@@ -607,106 +697,46 @@ class IslandAccessibilityService : AccessibilityService(),
             cameraManager.setTorchMode(camId, next)
             isTorchOn = next
             IslandStateEngine.updateQuickTileState(torch = next)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun toggleBluetoothDirectly() {
+    private fun toggleBluetoothSilently() {
         val adapter = bluetoothManager?.adapter ?: return
-        val currentlyOn = try { adapter.isEnabled } catch (_: Exception) { false }
+        val currentlyOn = try { adapter.isEnabled } catch (e: Exception) { false }
         val nextState = !currentlyOn
 
-        var handledDirectly = false
+        var handled = false
         try {
             @Suppress("DEPRECATION")
-            handledDirectly = if (nextState) adapter.enable() else adapter.disable()
-        } catch (_: Exception) {
-            handledDirectly = false
+            handled = if (nextState) adapter.enable() else adapter.disable()
+        } catch (e: Exception) {
+            handled = false
         }
 
-        if (handledDirectly) {
+        if (handled) {
             IslandStateEngine.updateQuickTileState(bluetooth = nextState)
         } else {
-            toggleQuickSettingsTileDirectly(listOf("Bluetooth", "BT")) {
-                IslandStateEngine.updateQuickTileState(bluetooth = nextState)
-            }
-        }
-    }
-
-    private fun toggleHotspotDirectly() {
-        val nextHotspot = !isHotspotOn
-        toggleQuickSettingsTileDirectly(listOf("Hotspot", "Wi-Fi hotspot", "Personal hotspot", "Tethering")) {
-            isHotspotOn = nextHotspot
-            IslandStateEngine.updateQuickTileState(hotspot = nextHotspot)
-            if (nextHotspot) {
-                IslandStateEngine.submitPayload(
-                    IslandPayload.SystemAlert(
-                        id = "hotspot_active",
-                        title = "Hotspot",
-                        subtitle = "Active",
-                        accentColor = Color(0xFF22C55E),
-                        iconType = AlertIconType.HOTSPOT,
-                        isOngoing = true
-                    )
-                )
-            } else {
-                IslandStateEngine.removePayload("hotspot_active")
-            }
-        }
-    }
-
-    private fun toggleQuickSettingsTileDirectly(
-        keywords: List<String>,
-        onCompleted: () -> Unit
-    ) {
-        serviceScope.launch {
             try {
-                performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
-                delay(280L)
-                val root = rootInActiveWindow
-                var clicked = false
-                if (root != null) {
-                    clicked = findAndClickTileNode(root, keywords)
-                }
-                delay(180L)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    performGlobalAction(GLOBAL_ACTION_DISMISS_NOTIFICATION_SHADE)
+                val action = if (nextState) {
+                    BluetoothAdapter.ACTION_REQUEST_ENABLE
                 } else {
-                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    "android.settings.BLUETOOTH_PAIRING_SETTINGS"
                 }
-                if (clicked) {
-                    onCompleted()
-                }
-            } catch (_: Exception) {
+                startActivity(Intent(action).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                })
+                IslandStateEngine.collapseIsland()
+            } catch (e: Exception) {
+                try {
+                    startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    })
+                    IslandStateEngine.collapseIsland()
+                } catch (e2: Exception) {}
             }
         }
-    }
-
-    private fun findAndClickTileNode(
-        node: AccessibilityNodeInfo,
-        keywords: List<String>
-    ): Boolean {
-        val text = node.text?.toString().orEmpty()
-        val desc = node.contentDescription?.toString().orEmpty()
-        val matches = keywords.any { kw ->
-            text.contains(kw, ignoreCase = true) || desc.contains(kw, ignoreCase = true)
-        }
-        if (matches) {
-            var current: AccessibilityNodeInfo? = node
-            while (current != null) {
-                if (current.isClickable) {
-                    current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                    return true
-                }
-                current = current.parent
-            }
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (findAndClickTileNode(child, keywords)) return true
-        }
-        return false
     }
 
     private fun toggleAutoRotateDirectly() {
@@ -725,7 +755,7 @@ class IslandAccessibilityService : AccessibilityService(),
                 }
                 startActivity(writeSettingsIntent)
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
@@ -739,7 +769,7 @@ class IslandAccessibilityService : AccessibilityService(),
         try {
             audioManager.ringerMode = next
             IslandStateEngine.updateQuickTileState(ringerMode = next)
-        } catch (_: SecurityException) {
+        } catch (e: SecurityException) {
             val fallback = if (current == AudioManager.RINGER_MODE_NORMAL) {
                 AudioManager.RINGER_MODE_VIBRATE
             } else {
@@ -748,7 +778,7 @@ class IslandAccessibilityService : AccessibilityService(),
             try {
                 audioManager.ringerMode = fallback
                 IslandStateEngine.updateQuickTileState(ringerMode = fallback)
-            } catch (_: Exception) {}
+            } catch (e2: Exception) {}
         }
     }
 
@@ -758,26 +788,7 @@ class IslandAccessibilityService : AccessibilityService(),
             val target = (fraction * max).roundToInt().coerceIn(0, max)
             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
             IslandStateEngine.updateQuickTileState(volumeFraction = fraction.coerceIn(0f, 1f))
-        } catch (_: Exception) {
-        }
-    }
-
-    private fun setScreenBrightnessFraction(fraction: Float) {
-        try {
-            if (Settings.System.canWrite(this)) {
-                val target = (fraction * 255f).roundToInt().coerceIn(10, 255)
-                Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, target)
-                IslandStateEngine.updateQuickTileState(brightnessFraction = fraction.coerceIn(0.05f, 1f))
-            } else {
-                val writeSettingsIntent = Intent(
-                    Settings.ACTION_MANAGE_WRITE_SETTINGS,
-                    "package:$packageName".toUri()
-                ).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                startActivity(writeSettingsIntent)
-            }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
@@ -788,7 +799,7 @@ class IslandAccessibilityService : AccessibilityService(),
             val clip = ClipData.newPlainText("island_paste", text)
             clipboardManager.setPrimaryClip(clip)
             focused.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
@@ -803,14 +814,8 @@ class IslandAccessibilityService : AccessibilityService(),
                         captureClipboardWithBriefFocus()
                     }
                 }
-                AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
-                    val toastText = event.text.joinToString(" ").lowercase()
-                    if (toastText.contains("copied")) {
-                        captureClipboardWithBriefFocus()
-                    }
-                }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
         }
     }
 
@@ -819,17 +824,21 @@ class IslandAccessibilityService : AccessibilityService(),
     override fun onDestroy() {
         super.onDestroy()
         try {
+            sharedPrefs.unregisterOnSharedPreferenceChangeListener(prefsChangeListener)
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
             store.clear()
             serviceScope.cancel()
             contentResolver.unregisterContentObserver(rotationObserver)
-            unregisterReceiver(systemEventReceiver)
-        } catch (_: Exception) {
+            if (isReceiverRegistered) {
+                unregisterReceiver(systemEventReceiver)
+                isReceiverRegistered = false
+            }
+        } catch (e: Exception) {
         }
         if (isViewAttached && composeOverlayView != null) {
             try {
                 windowManager.removeView(composeOverlayView)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
             } finally {
                 isViewAttached = false
             }
