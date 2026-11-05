@@ -61,25 +61,12 @@ class IslandAccessibilityService : AccessibilityService(),
     private lateinit var cameraManager: CameraManager
     private lateinit var audioManager: AudioManager
     private lateinit var clipboardManager: ClipboardManager
-    private lateinit var sharedPrefs: SharedPreferences
     private var bluetoothManager: BluetoothManager? = null
     private var currentTorchCameraId: String? = null
     private var isTorchOn = false
+    private var isHotspotOn = false
     private var lastProcessedClip: String = ""
     private var lastClipboardCheckTimeMs = 0L
-
-    private var hasCustomPortraitPos = false
-    private var hasCustomLandscapePos = false
-
-    private val prefsChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (key == "idle_text_enabled" || key == "idle_custom_text") {
-            applyOverlayWindowLayout(
-                IslandStateEngine.displayMode.value,
-                IslandStateEngine.cutoutConfig.value,
-                IslandStateEngine.privacyState.value
-            )
-        }
-    }
 
     private val rotationObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean) {
@@ -96,10 +83,8 @@ class IslandAccessibilityService : AccessibilityService(),
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         clipboardManager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
         bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as? BluetoothManager
-        sharedPrefs = getSharedPreferences("kgc_island2_prefs", Context.MODE_PRIVATE)
-        sharedPrefs.registerOnSharedPreferenceChangeListener(prefsChangeListener)
 
-        loadSavedDragPositions()
+        IslandStateEngine.loadPersistedPreferences(this)
     }
 
     private fun initLifecycleIfNeeded() {
@@ -113,64 +98,6 @@ class IslandAccessibilityService : AccessibilityService(),
         }
     }
 
-    private fun loadSavedDragPositions() {
-        try {
-            hasCustomPortraitPos = sharedPrefs.getBoolean("has_custom_port", false)
-            hasCustomLandscapePos = sharedPrefs.getBoolean("has_custom_land", false)
-            val current = IslandStateEngine.cutoutConfig.value
-            val savedSize = sharedPrefs.getInt("circle_size_dp", current.idleCircleSizeDp)
-            IslandStateEngine.updateCutoutConfig(
-                current.copy(
-                    offsetX = sharedPrefs.getInt("port_x", current.offsetX),
-                    offsetY = sharedPrefs.getInt("port_y", current.offsetY),
-                    landscapeCutoutX = sharedPrefs.getInt("land_x", current.landscapeCutoutX),
-                    landscapeCutoutY = sharedPrefs.getInt("land_y", current.landscapeCutoutY),
-                    baseWidthDp = savedSize,
-                    baseHeightDp = savedSize,
-                    idleCircleSizeDp = savedSize
-                )
-            )
-        } catch (e: Exception) {
-        }
-    }
-
-    private fun handleHoldAndDragInMemory(deltaX: Int, deltaY: Int) {
-        val cur = IslandStateEngine.cutoutConfig.value
-        val updated = if (cur.isLandscape) {
-            hasCustomLandscapePos = true
-            val nextX = if (cur.landscapeRotation == Surface.ROTATION_270) {
-                (cur.landscapeCutoutX - deltaX).coerceIn(-600, 1200)
-            } else {
-                (cur.landscapeCutoutX + deltaX).coerceIn(-600, 1200)
-            }
-            val nextY = (cur.landscapeCutoutY + deltaY).coerceIn(-500, 500)
-            cur.copy(landscapeCutoutX = nextX, landscapeCutoutY = nextY)
-        } else {
-            hasCustomPortraitPos = true
-            val nextX = (cur.offsetX + deltaX).coerceIn(-500, 500)
-            val nextY = (cur.offsetY + deltaY).coerceIn(-40, 800)
-            cur.copy(offsetX = nextX, offsetY = nextY)
-        }
-        IslandStateEngine.updateCutoutConfig(updated)
-    }
-
-    private fun saveHoldAndDragToDisk() {
-        try {
-            val cfg = IslandStateEngine.cutoutConfig.value
-            sharedPrefs.edit().apply {
-                putInt("port_x", cfg.offsetX)
-                putInt("port_y", cfg.offsetY)
-                putInt("land_x", cfg.landscapeCutoutX)
-                putInt("land_y", cfg.landscapeCutoutY)
-                putInt("circle_size_dp", cfg.idleCircleSizeDp)
-                putBoolean("has_custom_port", hasCustomPortraitPos)
-                putBoolean("has_custom_land", hasCustomLandscapePos)
-                apply()
-            }
-        } catch (e: Exception) {
-        }
-    }
-
     override fun onServiceConnected() {
         super.onServiceConnected()
         try {
@@ -180,9 +107,10 @@ class IslandAccessibilityService : AccessibilityService(),
 
             setupOverlayWindow()
             observeDisplayModeForWindowSizing()
+            observePinnedShortcutApps()
 
             serviceScope.launch {
-                delay(250L)
+                delay(300L)
                 registerHardwareAndSystemCallbacks()
                 syncQuickTileStates()
             }
@@ -201,6 +129,33 @@ class IslandAccessibilityService : AccessibilityService(),
         super.onTaskRemoved(rootIntent)
         if (!isViewAttached) {
             setupOverlayWindow()
+        }
+    }
+
+    private fun observePinnedShortcutApps() {
+        serviceScope.launch {
+            IslandStateEngine.pinnedShortcutPackages.collectLatest { pkgSet ->
+                val resolved = withContext(Dispatchers.IO) {
+                    val pm = packageManager
+                    pkgSet.mapNotNull { pkg ->
+                        try {
+                            val appInfo = pm.getApplicationInfo(pkg, 0)
+                            val launchIntent = pm.getLaunchIntentForPackage(pkg)?.apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            } ?: return@mapNotNull null
+                            TargetAppInfo(
+                                label = pm.getApplicationLabel(appInfo).toString(),
+                                packageName = pkg,
+                                icon = pm.getApplicationIcon(appInfo),
+                                launchIntent = launchIntent
+                            )
+                        } catch (e: Exception) {
+                            null
+                        }
+                    }
+                }
+                IslandStateEngine.updatePinnedShortcutsList(resolved)
+            }
         }
     }
 
@@ -298,6 +253,7 @@ class IslandAccessibilityService : AccessibilityService(),
                     },
                     onToggleTorch = { toggleFlashlightDirectly() },
                     onToggleBluetooth = { toggleBluetoothSilently() },
+                    onToggleHotspot = { toggleHotspotCleanly() },
                     onToggleAutoRotate = { toggleAutoRotateDirectly() },
                     onToggleRingerMode = { toggleRingerModeDirectly() },
                     onTakeScreenshot = {
@@ -322,10 +278,10 @@ class IslandAccessibilityService : AccessibilityService(),
                         syncQuickTileStates()
                     },
                     onDragReposition = { dx, dy ->
-                        handleHoldAndDragInMemory(dx.roundToInt(), dy.roundToInt())
+                        IslandStateEngine.updateDraggedOffsetInMemory(dx.roundToInt(), dy.roundToInt())
                     },
                     onDragRepositionEnd = {
-                        saveHoldAndDragToDisk()
+                        IslandStateEngine.commitCutoutConfigToDisk(this@IslandAccessibilityService)
                     },
                     onRequestKeyboardFocus = { needsFocus ->
                         setWindowKeyboardFocusable(needsFocus)
@@ -369,14 +325,14 @@ class IslandAccessibilityService : AccessibilityService(),
                 circleDp = detectedDp.coerceIn(26, 48)
                 val circlePx = (circleDp * density).roundToInt()
 
-                if (isLandscape && !hasCustomLandscapePos) {
+                if (isLandscape && !IslandStateEngine.hasCustomLandscapePosition()) {
                     landX = if (rotation == Surface.ROTATION_270) {
                         (screenW - rect.centerX() - (circlePx / 2)).coerceAtLeast(8)
                     } else {
                         (rect.centerX() - (circlePx / 2)).coerceAtLeast(8)
                     }
                     landY = rect.centerY() - (screenH / 2)
-                } else if (!isLandscape && !hasCustomPortraitPos) {
+                } else if (!isLandscape && !IslandStateEngine.hasCustomPortraitPosition()) {
                     portX = rect.centerX() - (screenW / 2)
                     portY = rect.top.coerceAtLeast(6)
                 }
@@ -408,66 +364,54 @@ class IslandAccessibilityService : AccessibilityService(),
             ) { mode: IslandDisplayMode, config: CutoutConfig, privacy: PrivacyIndicatorState ->
                 Triple(mode, config, privacy)
             }.collectLatest { (mode, config, privacy) ->
-                applyOverlayWindowLayout(mode, config, privacy)
-            }
-        }
-    }
+                if (!isViewAttached || composeOverlayView == null) return@collectLatest
+                val density = resources.displayMetrics.density
 
-    private fun applyOverlayWindowLayout(
-        mode: IslandDisplayMode,
-        config: CutoutConfig,
-        privacy: PrivacyIndicatorState
-    ) {
-        if (!isViewAttached || composeOverlayView == null) return
-        val density = resources.displayMetrics.density
-        val idleTextEnabled = sharedPrefs.getBoolean("idle_text_enabled", false)
-        val idleCustomText = sharedPrefs.getString("idle_custom_text", "").orEmpty()
-
-        val (targetW, targetH) = when (mode) {
-            IslandDisplayMode.IDLE -> {
-                val basePx = (config.idleCircleSizeDp * density).toInt()
-                val extraTextWidth = if (idleTextEnabled && idleCustomText.isNotBlank()) {
-                    (128 * density).toInt()
-                } else if (privacy.isCameraActive || privacy.isMicActive) {
-                    (18 * density).toInt()
-                } else {
-                    0
+                val (targetW, targetH) = when (mode) {
+                    IslandDisplayMode.IDLE -> {
+                        val basePx = (config.idleCircleSizeDp * density).toInt()
+                        val widthPx = if (privacy.isCameraActive || privacy.isMicActive) {
+                            basePx + (18 * density).toInt()
+                        } else {
+                            basePx
+                        }
+                        Pair(widthPx, basePx)
+                    }
+                    IslandDisplayMode.COMPACT_SINGLE -> Pair((215 * density).toInt(), (38 * density).toInt())
+                    IslandDisplayMode.COMPACT_SPLIT -> Pair((268 * density).toInt(), (38 * density).toInt())
+                    IslandDisplayMode.EXPANDED_CARD,
+                    IslandDisplayMode.ORIGIN_DRAG_WHEEL,
+                    IslandDisplayMode.QUICK_TOOLS -> Pair((364 * density).toInt(), (228 * density).toInt())
                 }
-                Pair(basePx + extraTextWidth, basePx)
+
+                windowParams.width = targetW
+                windowParams.height = targetH
+
+                if (config.isLandscape && mode == IslandDisplayMode.IDLE) {
+                    if (config.landscapeRotation == Surface.ROTATION_270) {
+                        windowParams.gravity = Gravity.CENTER_VERTICAL or Gravity.END
+                        windowParams.x = config.landscapeCutoutX
+                        windowParams.y = config.landscapeCutoutY
+                    } else {
+                        windowParams.gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                        windowParams.x = config.landscapeCutoutX
+                        windowParams.y = config.landscapeCutoutY
+                    }
+                } else if (config.isLandscape) {
+                    windowParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                    windowParams.x = config.landscapeCutoutY
+                    windowParams.y = (10 * density).toInt()
+                } else {
+                    windowParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                    windowParams.x = config.offsetX
+                    windowParams.y = config.offsetY
+                }
+
+                try {
+                    windowManager.updateViewLayout(composeOverlayView, windowParams)
+                } catch (e: Exception) {
+                }
             }
-            IslandDisplayMode.COMPACT_SINGLE -> Pair((225 * density).toInt(), (40 * density).toInt())
-            IslandDisplayMode.COMPACT_SPLIT -> Pair((276 * density).toInt(), (40 * density).toInt())
-            IslandDisplayMode.EXPANDED_CARD,
-            IslandDisplayMode.ORIGIN_DRAG_WHEEL,
-            IslandDisplayMode.QUICK_TOOLS -> Pair((364 * density).toInt(), (236 * density).toInt())
-        }
-
-        windowParams.width = targetW
-        windowParams.height = targetH
-
-        if (config.isLandscape && mode == IslandDisplayMode.IDLE) {
-            if (config.landscapeRotation == Surface.ROTATION_270) {
-                windowParams.gravity = Gravity.CENTER_VERTICAL or Gravity.END
-                windowParams.x = config.landscapeCutoutX
-                windowParams.y = config.landscapeCutoutY
-            } else {
-                windowParams.gravity = Gravity.CENTER_VERTICAL or Gravity.START
-                windowParams.x = config.landscapeCutoutX
-                windowParams.y = config.landscapeCutoutY
-            }
-        } else if (config.isLandscape) {
-            windowParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            windowParams.x = config.landscapeCutoutY
-            windowParams.y = (10 * density).toInt()
-        } else {
-            windowParams.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            windowParams.x = config.offsetX
-            windowParams.y = config.offsetY
-        }
-
-        try {
-            windowManager.updateViewLayout(composeOverlayView, windowParams)
-        } catch (e: Exception) {
         }
     }
 
@@ -522,13 +466,17 @@ class IslandAccessibilityService : AccessibilityService(),
             }
             val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
             val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val bm = getSystemService(BATTERY_SERVICE) as? BatteryManager
+            val batPct = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)?.coerceIn(1, 100) ?: 100
 
             IslandStateEngine.updateQuickTileState(
                 torch = isTorchOn,
                 bluetooth = btOn,
+                hotspot = isHotspotOn,
                 autoRotate = rotateOn,
                 ringerMode = audioManager.ringerMode,
-                volumeFraction = (curVol.toFloat() / maxVol.toFloat()).coerceIn(0f, 1f)
+                volumeFraction = (curVol.toFloat() / maxVol.toFloat()).coerceIn(0f, 1f),
+                batteryPct = batPct
             )
         } catch (e: Exception) {
         }
@@ -602,8 +550,10 @@ class IslandAccessibilityService : AccessibilityService(),
                     addAction(Intent.ACTION_SCREEN_ON)
                     addAction(Intent.ACTION_POWER_CONNECTED)
                     addAction(Intent.ACTION_BATTERY_LOW)
+                    addAction(Intent.ACTION_BATTERY_CHANGED)
                     addAction(AudioManager.RINGER_MODE_CHANGED_ACTION)
                     addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+                    addAction("android.net.wifi.WIFI_AP_STATE_CHANGED")
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     registerReceiver(systemEventReceiver, filter, Context.RECEIVER_EXPORTED)
@@ -629,8 +579,37 @@ class IslandAccessibilityService : AccessibilityService(),
                         IslandStateEngine.onScreenPowerStateChanged(true)
                         syncQuickTileStates()
                     }
+                    Intent.ACTION_BATTERY_CHANGED -> {
+                        val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                        val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
+                        if (level >= 0) {
+                            val pct = ((level * 100f) / scale).roundToInt().coerceIn(1, 100)
+                            IslandStateEngine.updateQuickTileState(batteryPct = pct)
+                        }
+                    }
                     BluetoothAdapter.ACTION_STATE_CHANGED -> {
                         syncQuickTileStates()
+                    }
+                    "android.net.wifi.WIFI_AP_STATE_CHANGED" -> {
+                        val state = intent.getIntExtra("wifi_state", 0)
+                        if (state == 13 && !isHotspotOn) {
+                            isHotspotOn = true
+                            IslandStateEngine.updateQuickTileState(hotspot = true)
+                            IslandStateEngine.submitPayload(
+                                IslandPayload.SystemAlert(
+                                    id = "hotspot_active",
+                                    title = "Hotspot",
+                                    subtitle = "Active",
+                                    accentColor = Color(0xFF22C55E),
+                                    iconType = AlertIconType.HOTSPOT,
+                                    isOngoing = true
+                                )
+                            )
+                        } else if ((state == 11 || state == 14) && isHotspotOn) {
+                            isHotspotOn = false
+                            IslandStateEngine.updateQuickTileState(hotspot = false)
+                            IslandStateEngine.removePayload("hotspot_active")
+                        }
                     }
                     Intent.ACTION_POWER_CONNECTED -> {
                         val bm = getSystemService(BATTERY_SERVICE) as BatteryManager
@@ -638,6 +617,7 @@ class IslandAccessibilityService : AccessibilityService(),
                         val currentNowMicroAmps = kotlin.math.abs(bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW))
                         val currentMa = (currentNowMicroAmps / 1000).toInt()
                         val sub = if (currentMa > 0) "Super Charge • ${currentMa}mA" else "Charging Active"
+                        val duration = IslandStateEngine.cutoutConfig.value.chargingDurationMs.coerceIn(5000L, 8000L)
 
                         IslandStateEngine.submitPayload(
                             IslandPayload.SystemAlert(
@@ -646,7 +626,7 @@ class IslandAccessibilityService : AccessibilityService(),
                                 subtitle = sub,
                                 accentColor = Color(0xFF4ADE80),
                                 iconType = AlertIconType.CHARGING,
-                                autoDismissMs = 6500L
+                                autoDismissMs = duration
                             )
                         )
                     }
@@ -739,6 +719,29 @@ class IslandAccessibilityService : AccessibilityService(),
         }
     }
 
+    private fun toggleHotspotCleanly() {
+        IslandStateEngine.collapseIsland()
+        try {
+            val tetherIntent = Intent().apply {
+                setClassName("com.android.settings", "com.android.settings.TetherSettings")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(tetherIntent)
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent("android.settings.TETHER_SETTINGS").apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                })
+            } catch (e2: Exception) {
+                try {
+                    startActivity(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    })
+                } catch (e3: Exception) {}
+            }
+        }
+    }
+
     private fun toggleAutoRotateDirectly() {
         try {
             if (Settings.System.canWrite(this)) {
@@ -824,7 +827,6 @@ class IslandAccessibilityService : AccessibilityService(),
     override fun onDestroy() {
         super.onDestroy()
         try {
-            sharedPrefs.unregisterOnSharedPreferenceChangeListener(prefsChangeListener)
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
             store.clear()
             serviceScope.cancel()

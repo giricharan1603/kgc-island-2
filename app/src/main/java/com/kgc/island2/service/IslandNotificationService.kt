@@ -4,52 +4,42 @@ import android.app.Notification
 import android.app.RemoteInput
 import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
-import android.graphics.drawable.Drawable
+import android.graphics.drawable.Icon
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
-import android.os.SystemClock
+import android.os.Build
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import androidx.compose.ui.graphics.Color
 import com.kgc.island2.engine.IslandStateEngine
+import com.kgc.island2.model.IslandDisplayMode
 import com.kgc.island2.model.IslandPayload
 import kotlinx.coroutines.*
-import org.json.JSONArray
-import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
-import java.util.concurrent.ConcurrentHashMap
 
 class IslandNotificationService : NotificationListenerService() {
 
-    private data class LyricEntry(val timeMs: Long, val text: String)
-
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var mediaSessionManager: MediaSessionManager? = null
-    private val activeCallbacks = mutableMapOf<MediaController, MediaController.Callback>()
+    private var activeControllers = listOf<MediaController>()
     private var progressTickerJob: Job? = null
 
-    private val lyricsMemoryCache = ConcurrentHashMap<String, List<LyricEntry>>()
-    private var currentlyFetchingKey: String = ""
-
     private val sessionListener = MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
-        bindMediaControllers(controllers.orEmpty())
+        bindMediaControllers(controllers ?: emptyList())
     }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
-        mediaSessionManager = getSystemService(MEDIA_SESSION_SERVICE) as? MediaSessionManager
-        val component = ComponentName(this, IslandNotificationService::class.java)
         try {
-            mediaSessionManager?.addOnActiveSessionsChangedListener(sessionListener, component)
-            bindMediaControllers(mediaSessionManager?.getActiveSessions(component).orEmpty())
+            mediaSessionManager = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+            val comp = ComponentName(this, IslandNotificationService::class.java)
+            val initial = mediaSessionManager?.getActiveSessions(comp).orEmpty()
+            bindMediaControllers(initial)
+            mediaSessionManager?.addOnActiveSessionsChangedListener(sessionListener, comp)
         } catch (e: Exception) {
         }
     }
@@ -57,324 +47,179 @@ class IslandNotificationService : NotificationListenerService() {
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
         try {
-            requestRebind(ComponentName(this, IslandNotificationService::class.java))
-        } catch (e: Exception) {
-        }
-    }
-
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-        try {
+            mediaSessionManager?.removeOnActiveSessionsChangedListener(sessionListener)
             requestRebind(ComponentName(this, IslandNotificationService::class.java))
         } catch (e: Exception) {
         }
     }
 
     private fun bindMediaControllers(controllers: List<MediaController>) {
-        activeCallbacks.forEach { (controller, callback) ->
-            try {
-                controller.unregisterCallback(callback)
-            } catch (e: Exception) {}
-        }
-        activeCallbacks.clear()
-        progressTickerJob?.cancel()
+        activeControllers = controllers
+        val primary = controllers.firstOrNull {
+            val state = it.playbackState?.state
+            state == PlaybackState.STATE_PLAYING ||
+                    state == PlaybackState.STATE_BUFFERING ||
+                    state == PlaybackState.STATE_PAUSED ||
+                    state == PlaybackState.STATE_SKIPPING_TO_NEXT ||
+                    state == PlaybackState.STATE_SKIPPING_TO_PREVIOUS
+        } ?: controllers.firstOrNull()
 
-        if (controllers.isEmpty()) {
-            clearActiveLyricLine()
+        if (primary == null) {
+            progressTickerJob?.cancel()
             IslandStateEngine.removePayload("media_session")
             return
         }
 
-        controllers.forEach { controller ->
-            val callback = object : MediaController.Callback() {
-                override fun onPlaybackStateChanged(state: PlaybackState?) {
-                    publishMediaState(controller)
-                }
-
-                override fun onMetadataChanged(metadata: MediaMetadata?) {
-                    publishMediaState(controller)
-                }
-
-                override fun onSessionDestroyed() {
-                    clearActiveLyricLine()
+        publishMediaState(primary)
+        primary.registerCallback(object : MediaController.Callback() {
+            override fun onPlaybackStateChanged(state: PlaybackState?) {
+                if (state?.state == PlaybackState.STATE_STOPPED || state?.state == PlaybackState.STATE_NONE) {
                     IslandStateEngine.removePayload("media_session")
+                } else {
+                    publishMediaState(primary)
                 }
             }
-            try {
-                controller.registerCallback(callback)
-                activeCallbacks[controller] = callback
-                publishMediaState(controller)
-            } catch (e: Exception) {}
-        }
 
+            override fun onMetadataChanged(metadata: MediaMetadata?) {
+                publishMediaState(primary)
+            }
+        })
+
+        progressTickerJob?.cancel()
         progressTickerJob = serviceScope.launch {
             while (isActive) {
-                delay(900L)
-                val activeCtrl = activeCallbacks.keys.firstOrNull {
-                    it.playbackState?.state == PlaybackState.STATE_PLAYING
-                }
-                if (activeCtrl != null) {
-                    publishMediaState(activeCtrl)
+                delay(1000L)
+                if (IslandStateEngine.displayMode.value == IslandDisplayMode.EXPANDED_CARD) {
+                    val state = primary.playbackState?.state
+                    if (state == PlaybackState.STATE_PLAYING) {
+                        publishMediaState(primary)
+                    }
                 }
             }
         }
     }
 
     private fun publishMediaState(controller: MediaController) {
-        val metadata = controller.metadata ?: return
+        val meta = controller.metadata ?: return
         val state = controller.playbackState
         val pbState = state?.state ?: PlaybackState.STATE_NONE
 
-        if (pbState == PlaybackState.STATE_STOPPED || pbState == PlaybackState.STATE_NONE) {
-            clearActiveLyricLine()
-            IslandStateEngine.removePayload("media_session")
-            return
-        }
-
-        val title = metadata.getString(MediaMetadata.METADATA_KEY_TITLE)
-            ?: metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)
+        val title = meta.getString(MediaMetadata.METADATA_KEY_TITLE)
+            ?: meta.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)
             ?: return
-        val artist = metadata.getString(MediaMetadata.METADATA_KEY_ARTIST)
-            ?: metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
+        val artist = meta.getString(MediaMetadata.METADATA_KEY_ARTIST)
+            ?: meta.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)
             ?: ""
-        val rawArt = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-            ?: metadata.getBitmap(MediaMetadata.METADATA_KEY_ART)
-        val art = downscaleBitmap(rawArt, 128)
-        val duration = metadata.getLong(MediaMetadata.METADATA_KEY_DURATION).coerceAtLeast(1L)
+        val duration = meta.getLong(MediaMetadata.METADATA_KEY_DURATION).coerceAtLeast(1L)
+        val rawArt = meta.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: meta.getBitmap(MediaMetadata.METADATA_KEY_ART)
+        val art = rawArt?.let { downscaleBitmap(it, 128) }
 
         val basePos = state?.position ?: 0L
         val lastUpdate = state?.lastPositionUpdateTime ?: 0L
-        val speed = state?.playbackSpeed ?: 1f
         val currentPos = if (pbState == PlaybackState.STATE_PLAYING && lastUpdate > 0L) {
-            val elapsed = (SystemClock.elapsedRealtime() - lastUpdate).coerceAtLeast(0L)
-            (basePos + (elapsed * speed).toLong()).coerceIn(0L, duration)
+            val elapsed = android.os.SystemClock.elapsedRealtime() - lastUpdate
+            (basePos + (elapsed * (state?.playbackSpeed ?: 1f)).toLong()).coerceIn(0L, duration)
         } else {
             basePos.coerceIn(0L, duration)
         }
 
-        val progress = (currentPos.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
-        val isPlaying = pbState == PlaybackState.STATE_PLAYING || pbState == PlaybackState.STATE_BUFFERING
-
-        val songKey = "$title|$artist".lowercase()
-        val syncedEntries = lyricsMemoryCache[songKey]
-        if (syncedEntries == null && currentlyFetchingKey != songKey) {
-            currentlyFetchingKey = songKey
-            clearActiveLyricLine()
-            fetchSyncedLyricsAsync(songKey, title, artist)
-        }
-        val activeLyric = syncedEntries
-            ?.lastOrNull { it.timeMs <= currentPos + 300L }
-            ?.text
-            .orEmpty()
-        updateActiveLyricLine(activeLyric)
+        val progressFraction = if (duration > 0L) {
+            (currentPos.toFloat() / duration.toFloat()).coerceIn(0f, 1f)
+        } else 0f
 
         IslandStateEngine.submitPayload(
             IslandPayload.MediaActivity(
                 id = "media_session",
+                packageName = controller.packageName,
                 trackTitle = title,
                 artist = artist,
                 albumArt = art,
-                accentColor = extractDominantColor(art),
-                isPlaying = isPlaying,
-                progress = progress,
+                isPlaying = pbState == PlaybackState.STATE_PLAYING || pbState == PlaybackState.STATE_BUFFERING,
+                progress = progressFraction,
                 durationMs = duration,
-                packageName = controller.packageName,
+                accentColor = extractDominantAccent(art),
                 contentIntent = controller.sessionActivity,
                 onPlayPause = {
-                    try {
-                        val currentPb = controller.playbackState?.state
-                        if (currentPb == PlaybackState.STATE_PLAYING) {
-                            controller.transportControls.pause()
-                        } else {
-                            controller.transportControls.play()
-                        }
-                    } catch (e: Exception) {}
+                    val current = controller.playbackState?.state
+                    if (current == PlaybackState.STATE_PLAYING) {
+                        controller.transportControls.pause()
+                    } else {
+                        controller.transportControls.play()
+                    }
                 },
-                onNext = {
-                    try { controller.transportControls.skipToNext() } catch (e: Exception) {}
-                },
-                onPrevious = {
-                    try { controller.transportControls.skipToPrevious() } catch (e: Exception) {}
-                },
-                onSeekTo = { seekPosMs ->
-                    try { controller.transportControls.seekTo(seekPosMs) } catch (e: Exception) {}
-                }
+                onNext = { controller.transportControls.skipToNext() },
+                onPrevious = { controller.transportControls.skipToPrevious() },
+                onSeekTo = { posMs -> controller.transportControls.seekTo(posMs) }
             )
         )
     }
 
-    private fun fetchSyncedLyricsAsync(songKey: String, title: String, artist: String) {
-        serviceScope.launch(Dispatchers.IO) {
-            var conn: HttpURLConnection? = null
-            try {
-                val cleanTitle = title.replace(Regex("\\(.*?\\)|\\[.*?]"), "").trim()
-                val qTitle = URLEncoder.encode(cleanTitle, "UTF-8")
-                val qArtist = URLEncoder.encode(artist, "UTF-8")
-                val url = URL("https://lrclib.net/api/search?track_name=$qTitle&artist_name=$qArtist")
-                conn = (url.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = 4000
-                    readTimeout = 4000
-                    setRequestProperty("User-Agent", "KgcIsland2/1.0")
-                }
-                if (conn.responseCode == 200) {
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val arr = JSONArray(body)
-                    if (arr.length() > 0) {
-                        val first: JSONObject = arr.getJSONObject(0)
-                        val syncedLrc = first.optString("syncedLyrics", "")
-                        val plainLrc = first.optString("plainLyrics", "")
-                        val parsed = if (syncedLrc.isNotBlank()) {
-                            parseLrcString(syncedLrc)
-                        } else if (plainLrc.isNotBlank()) {
-                            plainLrc.lines()
-                                .map { it.trim() }
-                                .filter { it.isNotEmpty() }
-                                .mapIndexed { idx, line -> LyricEntry(idx * 4000L, line) }
-                        } else {
-                            emptyList()
-                        }
-                        lyricsMemoryCache[songKey] = parsed
-                    } else {
-                        lyricsMemoryCache[songKey] = emptyList()
-                    }
-                } else {
-                    lyricsMemoryCache[songKey] = emptyList()
-                }
-            } catch (e: Exception) {
-                lyricsMemoryCache[songKey] = emptyList()
-            } finally {
-                try { conn?.disconnect() } catch (e: Exception) {}
-            }
-        }
-    }
-
-    private fun parseLrcString(lrc: String): List<LyricEntry> {
-        val regex = Regex("""\[(\d{2}):(\d{2})\.(\d{2,3})](.*)""")
-        val list = mutableListOf<LyricEntry>()
-        for (line in lrc.lines()) {
-            val match = regex.find(line) ?: continue
-            val min = match.groupValues[1].toLongOrNull() ?: 0L
-            val sec = match.groupValues[2].toLongOrNull() ?: 0L
-            val fracStr = match.groupValues[3]
-            val ms = if (fracStr.length == 2) {
-                (fracStr.toLongOrNull() ?: 0L) * 10L
-            } else {
-                fracStr.toLongOrNull() ?: 0L
-            }
-            val text = match.groupValues[4].trim()
-            if (text.isNotEmpty()) {
-                list.add(LyricEntry(min * 60_000L + sec * 1000L + ms, text))
-            }
-        }
-        return list.sortedBy { it.timeMs }
-    }
-
-    private fun updateActiveLyricLine(lyric: String) {
-        try {
-            val prefs = getSharedPreferences("kgc_island2_prefs", Context.MODE_PRIVATE)
-            if (prefs.getString("current_lyric_line", "") != lyric) {
-                prefs.edit().putString("current_lyric_line", lyric).apply()
-            }
-        } catch (e: Exception) {}
-    }
-
-    private fun clearActiveLyricLine() {
-        updateActiveLyricLine("")
-    }
-
-    private fun triggerEdgeLightFlashForPackage(pkg: String) {
-        val hexColor: Long = when {
-            pkg.contains("whatsapp", true) -> 0xFF25D366L
-            pkg.contains("telegram", true) || pkg.contains("messaging", true) || pkg.contains("mms", true) -> 0xFF38BDF8L
-            pkg.contains("youtube", true) -> 0xFFEF4444L
-            pkg.contains("instagram", true) -> 0xFFEC4899L
-            pkg.contains("snapchat", true) -> 0xFFFACC15L
-            else -> 0xFFA855F7L
-        }
-        try {
-            getSharedPreferences("kgc_island2_prefs", Context.MODE_PRIVATE).edit()
-                .putLong("edge_flash_color", hexColor)
-                .putLong("edge_flash_timestamp", System.currentTimeMillis())
-                .apply()
-        } catch (e: Exception) {}
-    }
-
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         val notification = sbn?.notification ?: return
-        if (sbn.packageName == packageName) return
+        val pkg = sbn.packageName ?: return
+        if (pkg == packageName) return
+
+        if (notification.extras.containsKey(Notification.EXTRA_MEDIA_SESSION)) {
+            return
+        }
 
         val extras = notification.extras
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
-        if (title.isBlank() && text.isBlank()) return
-
-        triggerEdgeLightFlashForPackage(sbn.packageName)
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
+        if (title.isEmpty() && text.isEmpty()) return
 
         val category = notification.category
+        val isOngoing = (notification.flags and Notification.FLAG_ONGOING_EVENT) != 0
+        val progress = extras.getInt(Notification.EXTRA_PROGRESS, -1)
+        val progressMax = extras.getInt(Notification.EXTRA_PROGRESS_MAX, -1)
+        val hasProgress = progress >= 0 && progressMax > 0
 
-        if (category == Notification.CATEGORY_CALL) {
-            val actions = notification.actions.orEmpty()
-            val acceptIntent = actions.firstOrNull {
-                it.title.toString().contains("Answer", true) ||
-                        it.title.toString().contains("Accept", true)
+        if (category == Notification.CATEGORY_CALL || category == Notification.CATEGORY_MESSAGE || findReplyAction(notification) != null) {
+            val replyPair = findReplyAction(notification)
+            val largeIconBmp = loadLargeIconBitmap(notification.getLargeIcon())
+
+            val acceptIntent = notification.actions?.firstOrNull {
+                val lbl = it.title?.toString()?.lowercase().orEmpty()
+                lbl.contains("answer") || lbl.contains("accept")
             }?.actionIntent
-            val declineIntent = actions.firstOrNull {
-                it.title.toString().contains("Decline", true) ||
-                        it.title.toString().contains("Hang", true) ||
-                        it.title.toString().contains("Reject", true)
+
+            val declineIntent = notification.actions?.firstOrNull {
+                val lbl = it.title?.toString()?.lowercase().orEmpty()
+                lbl.contains("decline") || lbl.contains("reject") || lbl.contains("hang up") || lbl.contains("end")
             }?.actionIntent
 
             IslandStateEngine.submitPayload(
                 IslandPayload.CommunicationActivity(
                     id = sbn.key,
-                    senderName = title,
+                    senderName = title.ifEmpty { pkg },
                     messageOrStatus = text,
-                    isOngoingCall = sbn.isOngoing,
-                    contentIntent = notification.contentIntent,
+                    avatar = largeIconBmp,
+                    isOngoingCall = category == Notification.CATEGORY_CALL && isOngoing,
                     acceptIntent = acceptIntent,
-                    declineIntent = declineIntent
-                )
-            )
-            return
-        }
-
-        val progressMax = extras.getInt(Notification.EXTRA_PROGRESS_MAX, 0)
-        val progressCurr = extras.getInt(Notification.EXTRA_PROGRESS, 0)
-        if (sbn.isOngoing && (progressMax > 0 || category == Notification.CATEGORY_NAVIGATION || category == Notification.CATEGORY_STOPWATCH)) {
-            val fraction = if (progressMax > 0) (progressCurr.toFloat() / progressMax).coerceIn(0f, 1f) else 0.5f
-            IslandStateEngine.submitPayload(
-                IslandPayload.LiveProgressActivity(
-                    id = sbn.key,
-                    title = title,
-                    etaOrTimerText = text,
-                    progressFraction = fraction,
-                    appIcon = getSmallAppIconBitmap(sbn.packageName),
+                    declineIntent = declineIntent,
+                    replyActionIntent = replyPair?.first,
+                    remoteInput = replyPair?.second,
                     contentIntent = notification.contentIntent
                 )
             )
             return
         }
 
-        var foundRemoteInput: RemoteInput? = null
-        var replyPendingIntent = notification.contentIntent
-        notification.actions?.forEach { action ->
-            action.remoteInputs?.firstOrNull()?.let { remoteInput ->
-                foundRemoteInput = remoteInput
-                replyPendingIntent = action.actionIntent
-            }
-        }
+        if (hasProgress || (isOngoing && (category == Notification.CATEGORY_TRANSPORT || category == Notification.CATEGORY_NAVIGATION || category == Notification.CATEGORY_PROGRESS || category == Notification.CATEGORY_STOPWATCH || category == Notification.CATEGORY_ALARM))) {
+            val fraction = if (hasProgress) (progress.toFloat() / progressMax.toFloat()).coerceIn(0f, 1f) else 0.5f
+            val subText = extras.getCharSequence(Notification.EXTRA_SUB_TEXT)?.toString()
+                ?: if (hasProgress) "${(fraction * 100).toInt()}%" else text
 
-        if (foundRemoteInput != null || category == Notification.CATEGORY_MESSAGE) {
             IslandStateEngine.submitPayload(
-                IslandPayload.CommunicationActivity(
+                IslandPayload.LiveProgressActivity(
                     id = sbn.key,
-                    senderName = title,
-                    messageOrStatus = text,
-                    isOngoingCall = false,
-                    contentIntent = notification.contentIntent,
-                    remoteInput = foundRemoteInput,
-                    replyActionIntent = replyPendingIntent
+                    title = title,
+                    etaOrTimerText = subText,
+                    progressFraction = fraction,
+                    appIcon = loadLargeIconBitmap(notification.getLargeIcon()),
+                    accentColor = Color(0xFF38BDF8),
+                    contentIntent = notification.contentIntent
                 )
             )
         }
@@ -385,34 +230,29 @@ class IslandNotificationService : NotificationListenerService() {
         IslandStateEngine.removePayload(key)
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        progressTickerJob?.cancel()
-        serviceScope.cancel()
-        try {
-            mediaSessionManager?.removeOnActiveSessionsChangedListener(sessionListener)
-        } catch (e: Exception) {}
-    }
-
-    private fun downscaleBitmap(src: Bitmap?, maxDim: Int): Bitmap? {
-        if (src == null || src.isRecycled) return null
-        return try {
-            if (src.width <= maxDim && src.height <= maxDim) return src
-            Bitmap.createScaledBitmap(src, maxDim, maxDim, true)
-        } catch (e: Exception) {
-            src
+    private fun findReplyAction(notification: Notification): Pair<android.app.PendingIntent, RemoteInput>? {
+        val actions = notification.actions ?: return null
+        for (action in actions) {
+            val remoteInputs = action.remoteInputs ?: continue
+            for (input in remoteInputs) {
+                if (input.allowFreeFormInput && action.actionIntent != null) {
+                    return Pair(action.actionIntent, input)
+                }
+            }
         }
+        return null
     }
 
-    private fun getSmallAppIconBitmap(pkg: String): Bitmap? {
+    private fun loadLargeIconBitmap(icon: Icon?): Bitmap? {
+        if (icon == null) return null
         return try {
-            val drawable: Drawable = packageManager.getApplicationIcon(pkg)
+            val drawable = icon.loadDrawable(this) ?: return null
             if (drawable is BitmapDrawable && drawable.bitmap != null) {
-                downscaleBitmap(drawable.bitmap, 64)
+                downscaleBitmap(drawable.bitmap, 96)
             } else {
-                val bmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888)
+                val bmp = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
                 val canvas = Canvas(bmp)
-                drawable.setBounds(0, 0, 64, 64)
+                drawable.setBounds(0, 0, 96, 96)
                 drawable.draw(canvas)
                 bmp
             }
@@ -421,16 +261,27 @@ class IslandNotificationService : NotificationListenerService() {
         }
     }
 
-    private fun extractDominantColor(bitmap: Bitmap?): Color {
-        if (bitmap == null || bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) return Color(0xFF22C55E)
+    private fun downscaleBitmap(src: Bitmap, maxDim: Int): Bitmap {
+        if (src.width <= maxDim && src.height <= maxDim) return src
+        return Bitmap.createScaledBitmap(src, maxDim, maxDim, true)
+    }
+
+    private fun extractDominantAccent(bmp: Bitmap?): Color {
+        if (bmp == null) return Color(0xFF38BDF8)
         return try {
-            val pixel = bitmap.getPixel(bitmap.width / 2, bitmap.height / 2)
-            val r = ((pixel shr 16) and 0xFF).coerceAtLeast(80)
-            val g = ((pixel shr 8) and 0xFF).coerceAtLeast(80)
-            val b = (pixel and 0xFF).coerceAtLeast(80)
+            val pixel = bmp.getPixel(bmp.width / 2, bmp.height / 2)
+            val r = android.graphics.Color.red(pixel).coerceAtLeast(90)
+            val g = android.graphics.Color.green(pixel).coerceAtLeast(90)
+            val b = android.graphics.Color.blue(pixel).coerceAtLeast(90)
             Color(r, g, b)
         } catch (e: Exception) {
-            Color(0xFF22C55E)
+            Color(0xFF38BDF8)
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        progressTickerJob?.cancel()
+        serviceScope.cancel()
     }
 }

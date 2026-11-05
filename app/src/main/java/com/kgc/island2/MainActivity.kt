@@ -38,6 +38,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.kgc.island2.engine.IslandStateEngine
 import com.kgc.island2.model.AlertIconType
+import com.kgc.island2.model.CutoutConfig
 import com.kgc.island2.model.IslandPayload
 
 class MainActivity : ComponentActivity() {
@@ -413,7 +414,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveCalibrationPrefs(
-        cfg: com.kgc.island2.model.CutoutConfig,
+        cfg: CutoutConfig,
         customPort: Boolean? = null,
         customLand: Boolean? = null
     ) {

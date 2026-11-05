@@ -62,7 +62,6 @@ data class QuickTileStates(
     val isAutoRotateOn: Boolean = false,
     val ringerMode: Int = AudioManager.RINGER_MODE_NORMAL,
     val volumeFraction: Float = 0.5f,
-    val brightnessFraction: Float = 0.5f,
     val batteryPct: Int = 100
 )
 
